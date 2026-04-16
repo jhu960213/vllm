@@ -95,6 +95,49 @@ using _B8x8 = uint2;
 using _B8x4 = int32_t;  // used in builtins
 using bit8_t = uint8_t;
 
+// CDNA4 (gfx950) hardware-accelerated LDS transposed loads.
+// Semantics (generic): each lane reads 64 bits from its own per-lane LDS
+// address; the hardware then transposes the tile across a group of lanes
+// (group size depends on element granularity: 4 lanes for b16, 8 lanes for
+// b8). After the transpose, each lane in a group ends up with N elements
+// (N = group size) from N consecutive per-lane source addresses at the
+// lane's own position index within the group.
+//
+// Typical use (V-fetch): have the group of lanes share a common head_dim
+// base and differ in token offset (0,1,...,N-1). After the transpose, each
+// lane holds N tokens at its unique head_dim (= head_dim_base + lane_in_group).
+//
+// Only available on gfx950 (MI350X/MI355X). Replaces ~N scalar ds_read_u16
+// (or ds_read_u8) instructions per lane with a single transposed 64-bit LDS
+// load, delivering both wider bandwidth use and native bank-conflict-free
+// transpose.
+#if defined(__HIPCC__) && defined(__gfx950__)
+  #define VLLM_HAS_GFX950_DS_READ_TR 1
+using _B16x4_native_i16 =
+    __attribute__((__vector_size__(4 * sizeof(short)))) short;
+using _B8x8_native_i32 =
+    __attribute__((__vector_size__(2 * sizeof(int)))) int;
+
+// 4-way transpose for 16-bit elements (bf16 / f16).
+// Groups of 4 lanes each return 4 × 16-bit elements per lane.
+__device__ __forceinline__ _B16x4 ds_read_tr16_b64(const bit16_t* lds_ptr) {
+  _B16x4_native_i16 v = __builtin_amdgcn_ds_read_tr16_b64_v4i16(
+      reinterpret_cast<const _B16x4_native_i16*>(lds_ptr));
+  return *reinterpret_cast<_B16x4*>(&v);
+}
+
+// 8-way transpose for 8-bit elements (fp8 / e4m3 / e5m2).
+// Groups of 8 lanes each return 8 × 8-bit elements per lane (returned as
+// _B8x8 = uint2 = 8 bytes).
+__device__ __forceinline__ _B8x8 ds_read_tr8_b64(const bit8_t* lds_ptr) {
+  _B8x8_native_i32 v = __builtin_amdgcn_ds_read_tr8_b64_v2i32(
+      reinterpret_cast<const _B8x8_native_i32*>(lds_ptr));
+  return *reinterpret_cast<_B8x8*>(&v);
+}
+#else
+  #define VLLM_HAS_GFX950_DS_READ_TR 0
+#endif
+
 typedef struct _B8x16 {
   _B8x8 xy[2];
 } _B8x16;
@@ -666,25 +709,115 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
       // Step 2: Transposed LDS read — each row reads its block's data
       // in token-ordered fashion to produce the Vlocal register layout
       // expected by the SV MFMA.
+      //
+      // All paths below operate on the LDS contents written by Step 1's
+      // cooperative coalesced load — none of them perform scalar global
+      // gathers. They only differ in how the token-dim → head-dim
+      // transpose is expressed on the LDS side:
+      //
+      // - gfx950 (CDNA4), 16-bit KV (bf16/f16): ds_read_b64_tr_b16
+      //     Groups of 4 lanes, 4 tokens per lane per call.
+      //     2 calls per _B16x8 Vlocal slot.
+      // - gfx950 (CDNA4), 8-bit KV (fp8):       ds_read_b64_tr_b8
+      //     Groups of 8 lanes, 8 tokens per lane per call.
+      //     2 calls per _B16x8 slot (_B16x8 aliases _B8x16 for fp8).
+      // - gfx942 (CDNA3) or any non-gfx950 target: software LDS transpose
+      //     Per-lane strided LDS reads that collectively form a transpose,
+      //     producing the same Vlocal register layout as the hardware paths.
+      //
+      // The rowid-based gating is compatible with the hardware transpose
+      // instructions because entire 16-lane rows are gated uniformly, so all
+      // lanes within a 4-lane (tr16) or 8-lane (tr8) transpose group are
+      // either all active or all inactive, preserving per-group activity
+      // coherence.
       for (int b = 0; b < batch_block_count; b++) {
         const int flat_block_idx = batch_block_start + b;
         const int target_vtoken_depth = flat_block_idx / ROWS_PER_WARP;
         const int target_row = flat_block_idx % ROWS_PER_WARP;
 
         if (rowid == target_row) {
-          for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
-            const int vhead_elem =
-                vhe_depth * NWARPS * 16 + warpid * 16 + lane16id;
-            for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP;
-                 vfetch_depth++) {
-              cache_t temp[CONTIGUOUS_KV_ELEMS_16B_LOAD];
-              for (int t = 0; t < CONTIGUOUS_KV_ELEMS_16B_LOAD; t++) {
-                const int bo =
-                    vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD + t;
-                temp[t] = v_lds[b * BLOCK_SIZE + bo][vhead_elem];
+#if VLLM_HAS_GFX950_DS_READ_TR
+          if constexpr (sizeof(cache_t) == 2) {
+            // 16-bit hardware transpose path (ds_read_b64_tr_b16).
+            // Within each 4-lane group (lane16id/4), all 4 lanes share the
+            // same head_dim_base but differ in token offset (0..3). The
+            // instruction's intra-group transpose then delivers 4 tokens at
+            // the lane's unique head_dim (= head_dim_base + lane_in_group).
+            const int lane_in_group = lane16id % 4;
+            const int group_head_dim_base = (lane16id / 4) * 4;
+            for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+              const int head_dim_base = vhe_depth * NWARPS * 16 +
+                                        warpid * 16 + group_head_dim_base;
+              for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP;
+                   vfetch_depth++) {
+                const int token_base =
+                    vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                // Two transposed 64-bit loads per 8-token slot: first 4
+                // tokens → .xy[0], second 4 tokens → .xy[1].
+                Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth].xy[0] =
+                    ds_read_tr16_b64(reinterpret_cast<const bit16_t*>(
+                        &v_lds[b * BLOCK_SIZE + token_base + 0 +
+                               lane_in_group][head_dim_base]));
+                Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth].xy[1] =
+                    ds_read_tr16_b64(reinterpret_cast<const bit16_t*>(
+                        &v_lds[b * BLOCK_SIZE + token_base + 4 +
+                               lane_in_group][head_dim_base]));
               }
-              Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth] =
-                  *reinterpret_cast<const _B16x8*>(temp);
+            }
+          } else if constexpr (sizeof(cache_t) == 1) {
+            // 8-bit hardware transpose path (ds_read_b64_tr_b8).
+            // Within each 8-lane group (lane16id/8), all 8 lanes share the
+            // same head_dim_base but differ in token offset (0..7). The
+            // instruction's intra-group transpose delivers 8 tokens at the
+            // lane's unique head_dim (= head_dim_base + lane_in_group).
+            const int lane_in_group = lane16id % 8;
+            const int group_head_dim_base = (lane16id / 8) * 8;
+            for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+              const int head_dim_base = vhe_depth * NWARPS * 16 +
+                                        warpid * 16 + group_head_dim_base;
+              for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP;
+                   vfetch_depth++) {
+                const int token_base =
+                    vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                // VTLANELOOP == 1 for fp8 HD=128/64 (16 tokens per slot).
+                // Two transposed 64-bit loads: first 8 tokens fill the low
+                // 8 bytes of the slot, second 8 tokens fill the high 8 bytes.
+                _B8x8 result_lo = ds_read_tr8_b64(reinterpret_cast<const bit8_t*>(
+                    &v_lds[b * BLOCK_SIZE + token_base + 0 + lane_in_group]
+                          [head_dim_base]));
+                _B8x8 result_hi = ds_read_tr8_b64(reinterpret_cast<const bit8_t*>(
+                    &v_lds[b * BLOCK_SIZE + token_base + 8 + lane_in_group]
+                          [head_dim_base]));
+                // _B16x8 and _B8x16 share the same 16-byte storage.
+                // Each .xy[i] slot is 8 bytes — matches _B8x8 exactly.
+                Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth].xy[0] =
+                    *reinterpret_cast<const _B16x4*>(&result_lo);
+                Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth].xy[1] =
+                    *reinterpret_cast<const _B16x4*>(&result_hi);
+              }
+            }
+          } else
+#endif
+          {
+            // Software LDS transpose path (CDNA3 / any non-gfx950 target).
+            // All reads below are from LDS (populated by Step 1's cooperative
+            // coalesced load) — not from global memory. Each lane issues
+            // CONTIGUOUS_KV_ELEMS_16B_LOAD strided LDS halfword/byte reads
+            // that collectively form the token-dim → head-dim transpose.
+            for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+              const int vhead_elem =
+                  vhe_depth * NWARPS * 16 + warpid * 16 + lane16id;
+              for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP;
+                   vfetch_depth++) {
+                cache_t temp[CONTIGUOUS_KV_ELEMS_16B_LOAD];
+                for (int t = 0; t < CONTIGUOUS_KV_ELEMS_16B_LOAD; t++) {
+                  const int bo =
+                      vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD + t;
+                  temp[t] = v_lds[b * BLOCK_SIZE + bo][vhead_elem];
+                }
+                Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth] =
+                    *reinterpret_cast<const _B16x8*>(temp);
+              }
             }
           }
         }
@@ -1154,7 +1287,55 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
   floatx4 d_out[QHLOOP];
   float qk_max[QHLOOP];
 
-  __shared__ _B16x4 vout_shared[QHLOOP][VHELOOP][WARP_SIZE][NWARPS + 1];
+  // vout_shared is used for the final cross-warp SV MFMA accumulation (Phase 6).
+  // For KV_CACHE_LAYOUT == 1 (flash), the same LDS memory is reused as a
+  // per-warp V transpose buffer during the V-fetch phase. These two uses are
+  // temporally disjoint: V-fetch completes before Phase 4's __syncthreads(),
+  // and vout_shared is first written during the SV MFMA that follows Phase 5.
+  //
+  // The per-warp v_warp_lds region allows each warp to cooperatively coalesced-
+  // load a V block and read it back in transposed order, without any
+  // __syncthreads() (safe because each warp uses its own LDS region and
+  // wavefront lockstep guarantees intra-warp ordering). This avoids the
+  // warp-level-branching hazard that prevents the mfma16-style cooperative
+  // LDS transpose in this kernel.
+  //
+  // v_warp_lds is only needed for flash layout (KV_CACHE_LAYOUT == 1). For
+  // paged (0) and shuffle (2) layouts the V-fetch reads directly from global
+  // memory into Vlocal, so v_warp_lds is never referenced. In those cases we
+  // collapse its array dimensions to 1x1x1 so the union size is governed by
+  // vout_shared alone (5 KiB).
+  //
+  // For flash layout, we cap v_warp_lds at V_WARP_TOKENS_PER_CHUNK = 16
+  // tokens per warp (independent of BLOCK_SIZE). When BLOCK_SIZE > 16, each
+  // block is processed in V_SUB_BATCHES_PER_BLOCK = BLOCK_SIZE/16 chunks,
+  // each reusing the same 16-token v_warp_lds region in wavefront lockstep.
+  // This keeps LDS/WG ≤ 16.25 KiB for every supported config so the mfma4
+  // kernel always fits the 3 WG/CU VGPR-bound occupancy target on CDNA3
+  // (budget ~21.3 KiB); without this cap BLOCK_SIZE=32, HEAD_SIZE=128, bf16
+  // would allocate 32 KiB v_warp_lds and drop to 1 WG/CU on CDNA3.
+  //
+  // The total number of load+read iterations per warp is invariant:
+  //   VBLOCKS * V_SUB_BATCHES_PER_BLOCK = (64/BLOCK_SIZE) * (BLOCK_SIZE/16) = 4
+  // regardless of BLOCK_SIZE, so global memory bandwidth usage is unchanged.
+  //
+  // All accesses to v_warp_lds are guarded by `if constexpr (KV_CACHE_LAYOUT
+  // == 1)` so the 1x1x1 fallback is never addressed at runtime.
+  constexpr int V_WARP_TOKENS_PER_CHUNK =
+      (BLOCK_SIZE < 16) ? BLOCK_SIZE : 16;
+  static_assert(BLOCK_SIZE % V_WARP_TOKENS_PER_CHUNK == 0,
+                "BLOCK_SIZE must be a multiple of V_WARP_TOKENS_PER_CHUNK");
+  constexpr int V_SUB_BATCHES_PER_BLOCK =
+      BLOCK_SIZE / V_WARP_TOKENS_PER_CHUNK;
+
+  constexpr int V_WARP_LDS_DIM_0 = (KV_CACHE_LAYOUT == 1) ? NWARPS : 1;
+  constexpr int V_WARP_LDS_DIM_1 =
+      (KV_CACHE_LAYOUT == 1) ? V_WARP_TOKENS_PER_CHUNK : 1;
+  constexpr int V_WARP_LDS_DIM_2 = (KV_CACHE_LAYOUT == 1) ? HEAD_SIZE : 1;
+  __shared__ union {
+    _B16x4 vout_shared[QHLOOP][VHELOOP][WARP_SIZE][NWARPS + 1];
+    cache_t v_warp_lds[V_WARP_LDS_DIM_0][V_WARP_LDS_DIM_1][V_WARP_LDS_DIM_2];
+  };
 
   for (int h = 0; h < QHLOOP; h++) {
     d_out[h] = {0};
@@ -1281,52 +1462,125 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
     constexpr int KX_V = 16 / sizeof(cache_t);
 
     if constexpr (KV_CACHE_LAYOUT == 1) {
-      // Flash V: [blocks, block_size, heads, head_dim] — head_dim contiguous
-      // Uses scalar gather to produce token-ordered Vlocal for SV MFMA.
-      // NOTE: LDS transpose optimization (as used in mfma16 kernel) is not
-      // applicable here because the mfma4 kernel has warp-level branching
-      // (out-of-context warps skip this block), which prevents using
-      // __syncthreads() within this path.
+      // Flash V: [blocks, block_size, heads, head_dim] — head_dim contiguous.
+      //
+      // Warp-level LDS transpose: each warp cooperatively coalesced-loads a
+      // 16-token chunk of a V block into its own LDS region (v_warp_lds
+      // [warpid]) using 16B/lane loads, then reads it back in transposed
+      // order to produce token-ordered Vlocal / Vlocalb8 for the SV MFMA.
+      //
+      // Sub-batching: when BLOCK_SIZE > V_WARP_TOKENS_PER_CHUNK (= 16), each
+      // block is processed in V_SUB_BATCHES_PER_BLOCK passes, reusing the
+      // same 16-token v_warp_lds region. The load+read iteration count is
+      // invariant (always 4 per warp for WARP_SIZE=64) regardless of BS,
+      // but LDS footprint is capped at 16 tokens per warp — preserving
+      // 3 WG/CU occupancy on CDNA3 even for BLOCK_SIZE=32 HD=128 bf16.
+      //
+      // No __syncthreads() is needed: each warp uses its own LDS region and
+      // wavefront lockstep guarantees that all 64 lanes complete a store
+      // before any lane executes the next instruction. This sidesteps the
+      // warp-level branching (out-of-context warps skip this path) that
+      // prevents the mfma16-style cooperative barrier approach.
+      //
+      // Replaces BLOCK_SIZE * VHELOOP strided scalar loads per block with
+      // (V_WARP_TOKENS_PER_CHUNK * HEAD_SIZE * sizeof(cache_t) / 16) /
+      // WARP_SIZE coalesced 16B loads per warp per chunk, achieving ~100%
+      // cache-line utilization.
+      constexpr int V_LANES_PER_TOKEN =
+          (HEAD_SIZE * static_cast<int>(sizeof(cache_t))) / 16;
+      static_assert(V_LANES_PER_TOKEN > 0 &&
+                        WARP_SIZE % V_LANES_PER_TOKEN == 0,
+                    "HEAD_SIZE * sizeof(cache_t) must be a multiple of 16B "
+                    "and V_LANES_PER_TOKEN must divide WARP_SIZE");
+      constexpr int V_TOKENS_PER_LOAD = WARP_SIZE / V_LANES_PER_TOKEN;
+      static_assert(V_WARP_TOKENS_PER_CHUNK % V_TOKENS_PER_LOAD == 0,
+                    "V_WARP_TOKENS_PER_CHUNK must be a multiple of "
+                    "V_TOKENS_PER_LOAD");
+      constexpr int V_LOADS_PER_CHUNK =
+          V_WARP_TOKENS_PER_CHUNK / V_TOKENS_PER_LOAD;
+      constexpr int V_ELEMS_PER_LOAD = 16 / static_cast<int>(sizeof(cache_t));
+      static_assert(V_WARP_TOKENS_PER_CHUNK % 8 == 0,
+                    "V_WARP_TOKENS_PER_CHUNK must be a multiple of 8 "
+                    "(8 tokens per _B16x8 / _B8x8 slot)");
+      constexpr int V_CHUNK_SLOTS = V_WARP_TOKENS_PER_CHUNK / 8;
+
       const cache_t* v_ptr_head = v_cache + wg_start_kv_head_idx * HEAD_SIZE;
-      if constexpr (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto) {
-        for (int b = 0; b < VBLOCKS; b++) {
-          const int64_t vphysical_block_number =
-              static_cast<int64_t>(vphysical_blocks[b]);
-          const cache_t* v_block_ptr =
-              v_ptr_head + vphysical_block_number * kv_block_stride;
-          for (int h = 0; h < VHELOOP; h++) {
-            const int head_size_elem = h * WARP_SIZE + laneid;
-            for (int d = 0; d < BLOCK_SIZE / 8; d++) {
-              scalar_t temp_v[8];
-              for (int t = 0; t < 8; t++) {
-                const int token_idx = d * 8 + t;
-                temp_v[t] = *reinterpret_cast<const scalar_t*>(
-                    &v_block_ptr[token_idx * kv_head_stride + head_size_elem]);
+
+      for (int b = 0; b < VBLOCKS; b++) {
+        const int64_t vphysical_block_number =
+            static_cast<int64_t>(vphysical_blocks[b]);
+        const cache_t* v_block_ptr =
+            v_ptr_head + vphysical_block_number * kv_block_stride;
+
+        for (int sb = 0; sb < V_SUB_BATCHES_PER_BLOCK; sb++) {
+          const int token_base_in_block = sb * V_WARP_TOKENS_PER_CHUNK;
+
+          // Step 1: Cooperative coalesced load of V_WARP_TOKENS_PER_CHUNK
+          // tokens from the current block into v_warp_lds[warpid][0..CHUNK-1].
+          // Lane layout: (laneid / V_LANES_PER_TOKEN) selects a token within
+          // the chunk, (laneid % V_LANES_PER_TOKEN) selects a 16B chunk of
+          // head_dim. Each token's head_dim row is contiguous in flash
+          // layout, so every 16B lane chunk hits the same global cache line
+          // as its neighbors.
+          #pragma unroll
+          for (int load = 0; load < V_LOADS_PER_CHUNK; load++) {
+            const int tok_in_chunk =
+                load * V_TOKENS_PER_LOAD + laneid / V_LANES_PER_TOKEN;
+            const int tok_in_block = token_base_in_block + tok_in_chunk;
+            const int dim_elem =
+                (laneid % V_LANES_PER_TOKEN) * V_ELEMS_PER_LOAD;
+            *reinterpret_cast<uint4*>(
+                &v_warp_lds[warpid][tok_in_chunk][dim_elem]) =
+                *reinterpret_cast<const uint4*>(
+                    &v_block_ptr[tok_in_block * kv_head_stride + dim_elem]);
+          }
+          // No __syncthreads() — wavefront lockstep guarantees that the
+          // stores above are visible to all 64 lanes of this warp before
+          // the reads below execute.
+
+          // Step 2: Transposed LDS read → Vlocal / Vlocalb8.
+          // Each lane owns one head_dim element (head_size_elem) and gathers
+          // V_WARP_TOKENS_PER_CHUNK token values for it, producing the
+          // token-ordered layout the SV MFMA expects. Destination slot:
+          //   Vlocal[h][b * BLOCK_SIZE/8 + sb * V_CHUNK_SLOTS + d]
+          // which for BLOCK_SIZE=16 (SB=1) matches the original b*2+d
+          // formula exactly, and for BLOCK_SIZE=32 (SB=2) fills the 4
+          // per-block slots across two sub-batches.
+          if constexpr (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto) {
+            for (int h = 0; h < VHELOOP; h++) {
+              const int head_size_elem = h * WARP_SIZE + laneid;
+              for (int d = 0; d < V_CHUNK_SLOTS; d++) {
+                scalar_t temp_v[8];
+                for (int t = 0; t < 8; t++) {
+                  temp_v[t] = *reinterpret_cast<const scalar_t*>(
+                      &v_warp_lds[warpid][d * 8 + t][head_size_elem]);
+                }
+                const int vlocal_slot =
+                    b * (BLOCK_SIZE / 8) + sb * V_CHUNK_SLOTS + d;
+                Vlocal[h][vlocal_slot] =
+                    *reinterpret_cast<const _B16x8*>(temp_v);
               }
-              Vlocal[h][b * BLOCK_SIZE / 8 + d] =
-                  *reinterpret_cast<const _B16x8*>(temp_v);
+            }
+          } else {
+            for (int h = 0; h < VHELOOP; h++) {
+              const int head_size_elem = h * WARP_SIZE + laneid;
+              for (int d = 0; d < V_CHUNK_SLOTS; d++) {
+                cache_t temp_v[8];
+                for (int t = 0; t < 8; t++) {
+                  temp_v[t] = v_warp_lds[warpid][d * 8 + t][head_size_elem];
+                }
+                const int vlocal_slot =
+                    b * (BLOCK_SIZE / 8) + sb * V_CHUNK_SLOTS + d;
+                Vlocalb8[h][vlocal_slot] =
+                    *reinterpret_cast<const _B8x8*>(temp_v);
+              }
             }
           }
-        }
-      } else {
-        for (int b = 0; b < VBLOCKS; b++) {
-          const int64_t vphysical_block_number =
-              static_cast<int64_t>(vphysical_blocks[b]);
-          const cache_t* v_block_ptr =
-              v_ptr_head + vphysical_block_number * kv_block_stride;
-          for (int h = 0; h < VHELOOP; h++) {
-            const int head_size_elem = h * WARP_SIZE + laneid;
-            for (int d = 0; d < BLOCK_SIZE / 8; d++) {
-              cache_t temp_v[8];
-              for (int t = 0; t < 8; t++) {
-                const int token_idx = d * 8 + t;
-                temp_v[t] =
-                    v_block_ptr[token_idx * kv_head_stride + head_size_elem];
-              }
-              Vlocalb8[h][b * BLOCK_SIZE / 8 + d] =
-                  *reinterpret_cast<const _B8x8*>(temp_v);
-            }
-          }
+          // No trailing barrier — next sub-batch's cooperative store
+          // happens in the same warp and lockstep ordering keeps it
+          // ordered after the reads above. vout_shared (union alias) is
+          // not written until Phase 6, well after the __syncthreads() at
+          // the end of this warp-in-context branch.
         }
       }
     } else {
