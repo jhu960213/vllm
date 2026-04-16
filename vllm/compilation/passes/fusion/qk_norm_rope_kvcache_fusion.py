@@ -27,56 +27,6 @@ from .rms_quant_fusion import empty_bf16, empty_fp32, empty_i64
 logger = init_logger(__name__)
 
 
-def unify_reshape_batch_dim(graph: fx.Graph) -> None:
-    """Ensure all ``aten.reshape.default`` ops reference the same FX Node
-    for the batch (token) dimension.
-
-    After graph partitioning, some reshapes use a placeholder FX Node for
-    the batch dim while others retain a literal ``-1`` or a raw
-    ``SymInt``.  The pattern matcher's ``KeywordArg`` requires repeated
-    references to bind to the **same** graph node, so mixed
-    representations cause "repeated pattern differs" failures.
-
-    This pass finds the batch-dim placeholder from existing reshapes and
-    rewrites ``-1`` / raw ``SymInt`` entries to reference that node.
-    """
-    aten_reshape = torch.ops.aten.reshape.default
-
-    batch_node: torch.fx.Node | None = None
-    for node in graph.nodes:
-        if node.op != "call_function" or node.target is not aten_reshape:
-            continue
-        shape_arg = node.args[1]
-        if not isinstance(shape_arg, (list, tuple)):
-            continue
-        for s in shape_arg:
-            if isinstance(s, torch.fx.Node):
-                batch_node = s
-                break
-        if batch_node is not None:
-            break
-
-    if batch_node is None:
-        return
-
-    for node in graph.nodes:
-        if node.op != "call_function" or node.target is not aten_reshape:
-            continue
-        shape_arg = node.args[1]
-        if not isinstance(shape_arg, (list, tuple)):
-            continue
-        new_shape = list(shape_arg)
-        changed = False
-        for i, s in enumerate(new_shape):
-            if s == -1 or (
-                isinstance(s, torch.SymInt) and not isinstance(s, torch.fx.Node)
-            ):
-                new_shape[i] = batch_node
-                changed = True
-        if changed:
-            node.args = (node.args[0], new_shape)
-
-
 # ---------------------------------------------------------------------------
 # Custom op: fused QK-norm + RoPE + KV cache update
 # ---------------------------------------------------------------------------
@@ -171,7 +121,6 @@ class QkNormRopeKvCachePattern:
         eps: float,
         is_neox: bool,
         rope_flashinfer: bool = False,
-        match_rocm_aiter_rms: bool = False,
         match_rocm_aiter_rope: bool = False,
     ) -> None:
         self.layer_name = layer.layer_name
@@ -187,9 +136,7 @@ class QkNormRopeKvCachePattern:
         self.k_size = self.num_kv_heads * self.head_size
         self.v_size = self.num_kv_heads * self.head_size_v
 
-        self.rmsnorm_matcher = MatcherRMSNorm(
-            eps, match_rocm_aiter=match_rocm_aiter_rms
-        )
+        self.rmsnorm_matcher = MatcherRMSNorm(eps)
         self.rope_matcher = MatcherRotaryEmbedding(
             is_neox=is_neox,
             head_size=self.head_size,
@@ -213,20 +160,6 @@ class QkNormRopeKvCachePattern:
         return [qkv, positions, q_weight, k_weight, cos_sin_cache]
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
-        num_heads = self.num_heads
-        num_kv_heads = self.num_kv_heads
-        head_dim = self.head_size
-        head_dim_v = self.head_size_v
-        q_size = self.q_size
-        k_size = self.k_size
-        v_size = self.v_size
-        layer_name = self.layer_name
-        eps = self.eps
-        is_neox = self.is_neox
-
-        rmsnorm_matcher = self.rmsnorm_matcher
-        rope_matcher = self.rope_matcher
-
         def pattern(
             qkv: torch.Tensor,
             positions: torch.Tensor,
@@ -234,23 +167,26 @@ class QkNormRopeKvCachePattern:
             k_weight: torch.Tensor,
             cos_sin_cache: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            T = qkv.shape[0]
-            q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
+            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
-            q_by_head = q.view(T, q_size // head_dim, head_dim)
-            q_normed = rmsnorm_matcher(q_by_head, q_weight)
-            q_flat = q_normed.view(T, q_size)
+            q_by_head = q.view(-1, self.q_size // self.head_size, self.head_size)
+            q_normed = self.rmsnorm_matcher(q_by_head, q_weight)
+            q_flat = q_normed.view(-1, self.q_size)
 
-            k_by_head = k.view(T, k_size // head_dim, head_dim)
-            k_normed = rmsnorm_matcher(k_by_head, k_weight)
-            k_flat = k_normed.view(T, k_size)
+            k_by_head = k.view(-1, self.k_size // self.head_size, self.head_size)
+            k_normed = self.rmsnorm_matcher(k_by_head, k_weight)
+            k_flat = k_normed.view(-1, self.k_size)
 
-            q_rope, k_rope = rope_matcher(positions, q_flat, k_flat, cos_sin_cache)
+            q_rope, k_rope = self.rope_matcher(
+                positions, q_flat, k_flat, cos_sin_cache
+            )
 
-            q_rope = q_rope.view(T, num_heads, head_dim)
-            k_rope = k_rope.view(T, num_kv_heads, head_dim)
-            v = v.view(T, num_kv_heads, head_dim_v)
-            dummy = torch.ops.vllm.unified_kv_cache_update(k_rope, v, layer_name)
+            q_rope = q_rope.view(-1, self.num_heads, self.head_size)
+            k_rope = k_rope.view(-1, self.num_kv_heads, self.head_size)
+            v = v.view(-1, self.num_kv_heads, self.head_size_v)
+            dummy = torch.ops.vllm.unified_kv_cache_update(
+                k_rope, v, self.layer_name
+            )
             return dummy, q_rope, k_rope, v
 
         def replacement(
@@ -262,20 +198,20 @@ class QkNormRopeKvCachePattern:
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             q_out = torch.empty(
                 qkv.shape[0],
-                num_heads,
-                head_dim,
+                self.num_heads,
+                self.head_size,
                 device=qkv.device,
                 dtype=qkv.dtype,
             )
             k_out = torch.empty(
                 qkv.shape[0],
-                num_kv_heads,
-                head_dim,
+                self.num_kv_heads,
+                self.head_size,
                 device=qkv.device,
                 dtype=qkv.dtype,
             )
-            _, _, v = qkv.split([q_size, k_size, v_size], dim=-1)
-            v = v.view(qkv.shape[0], num_kv_heads, head_dim_v)
+            _, _, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+            v = v.view(qkv.shape[0], self.num_kv_heads, self.head_size_v)
 
             results = auto_functionalized(
                 self.FUSED_OP,
@@ -285,10 +221,10 @@ class QkNormRopeKvCachePattern:
                 positions=positions,
                 q_weight=q_weight,
                 k_weight=k_weight,
-                rms_norm_eps=eps,
+                rms_norm_eps=self.eps,
                 cos_sin_cache=cos_sin_cache,
-                is_neox=is_neox,
-                layer_name=layer_name,
+                is_neox=self.is_neox,
+                layer_name=self.layer_name,
             )
 
             # results[0] = dummy, results[1] = q_out, results[2] = k_out
@@ -353,10 +289,11 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
             rms_custom_enabled,
         )
 
-        aiter_rms_variants = [False]
-        if rocm_aiter_ops.is_rmsnorm_enabled():
-            aiter_rms_variants.append(True)
-
+        # RMS norm variants are no longer iterated: after the vLLM IR
+        # migration (#33825), `MatcherRMSNorm` dispatches via
+        # `ir.ops.rms_norm`, which resolves to the same backend (native /
+        # vllm_c / aiter / oink / ...) that the model's RMSNorm layer
+        # picks.  The pattern graph tracks the target graph automatically.
         aiter_rope_variants = [False]
         if rocm_aiter_ops.is_triton_rotary_embed_enabled():
             aiter_rope_variants.append(True)
@@ -375,57 +312,50 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
             if not layer.impl.fused_qk_norm_rope_kvcache_supported():
                 continue
             layer.impl.set_fused_kv_cache_layout(requested_layout)
-            for aiter_rms in aiter_rms_variants:
-                for aiter_rope in aiter_rope_variants:
-                    for epsilon in [1e-5, 1e-6]:
-                        for neox in [True, False]:
-                            if RotaryEmbedding.enabled():
-                                for rope_flashinfer in [False, True]:
-                                    try:
-                                        QkNormRopeKvCachePattern(
-                                            layer=layer,
-                                            eps=epsilon,
-                                            is_neox=neox,
-                                            rope_flashinfer=rope_flashinfer,
-                                            match_rocm_aiter_rms=aiter_rms,
-                                            match_rocm_aiter_rope=aiter_rope,
-                                        ).register(self.patterns)
-                                    except RuntimeError as e:
-                                        if "Duplicate pattern" in str(e):
-                                            logger.debug(
-                                                "Skipping duplicate pattern: "
-                                                "aiter_rms=%s aiter_rope=%s "
-                                                "eps=%s neox=%s fi=%s",
-                                                aiter_rms,
-                                                aiter_rope,
-                                                epsilon,
-                                                neox,
-                                                rope_flashinfer,
-                                            )
-                                        else:
-                                            raise
-                            else:
+            for aiter_rope in aiter_rope_variants:
+                for epsilon in [1e-5, 1e-6]:
+                    for neox in [True, False]:
+                        if RotaryEmbedding.enabled():
+                            for rope_flashinfer in [False, True]:
                                 try:
                                     QkNormRopeKvCachePattern(
                                         layer=layer,
                                         eps=epsilon,
                                         is_neox=neox,
-                                        match_rocm_aiter_rms=aiter_rms,
+                                        rope_flashinfer=rope_flashinfer,
                                         match_rocm_aiter_rope=aiter_rope,
                                     ).register(self.patterns)
                                 except RuntimeError as e:
                                     if "Duplicate pattern" in str(e):
                                         logger.debug(
                                             "Skipping duplicate pattern: "
-                                            "aiter_rms=%s aiter_rope=%s "
-                                            "eps=%s neox=%s fi=N/A",
-                                            aiter_rms,
+                                            "aiter_rope=%s eps=%s neox=%s fi=%s",
                                             aiter_rope,
                                             epsilon,
                                             neox,
+                                            rope_flashinfer,
                                         )
                                     else:
                                         raise
+                        else:
+                            try:
+                                QkNormRopeKvCachePattern(
+                                    layer=layer,
+                                    eps=epsilon,
+                                    is_neox=neox,
+                                    match_rocm_aiter_rope=aiter_rope,
+                                ).register(self.patterns)
+                            except RuntimeError as e:
+                                if "Duplicate pattern" in str(e):
+                                    logger.debug(
+                                        "Skipping duplicate pattern: "
+                                        "aiter_rope=%s eps=%s neox=%s fi=N/A",
+                                        aiter_rope,
+                                        epsilon,
+                                        neox,
+                                    )
+                                else:
+                                    raise
 
         # Backends using SHUFFLE layout (kv_cache_layout==2) require a
         # consistent V-cache layout across ALL compile ranges.  The unfused
@@ -461,21 +391,17 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        unify_reshape_batch_dim(graph)
-
-        import torch._inductor.pattern_matcher as _pm_mod
-
-        _orig_fx_to_pat = _pm_mod.fx_to_pattern
+        _orig_fx_to_pat = pm.fx_to_pattern
 
         def _relaxed_fx_to_pattern(*a, **kw):
             kw["ignore_types"] = (int, torch.SymInt)
             return _orig_fx_to_pat(*a, **kw)
 
-        _pm_mod.fx_to_pattern = _relaxed_fx_to_pattern
+        pm.fx_to_pattern = _relaxed_fx_to_pattern
         try:
             self.matched_count = self.patterns.apply(graph)
         finally:
-            _pm_mod.fx_to_pattern = _orig_fx_to_pat
+            pm.fx_to_pattern = _orig_fx_to_pat
 
         logger.info(
             "QK-Norm+RoPE+KVCache fusion: replaced %s pattern(s) "
