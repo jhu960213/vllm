@@ -90,6 +90,7 @@ def _fwd_kernel(
     USE_SINKS: tl.constexpr,
     USE_FP8: tl.constexpr,
     MAX_Q_LEN: tl.constexpr = 0,
+    KV_CACHE_LAYOUT: tl.constexpr = 0,  # 0=PAGED, 1=FLASH, 2=SHUFFLE
     INTERLEAVED_V_KX: tl.constexpr = 0,
     MAX_CTX_LEN: tl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
@@ -174,33 +175,45 @@ def _fwd_kernel(
         # each token within its physical block.
         internal_offsets = token_indices % PHYSICAL_BLOCK_SIZE
 
-        # Addressing of K (5D)
-        off_k = (
-            bn[None, :] * stride_k_cache_bs
-            + cur_kv_head * stride_k_cache_h
-            + (offs_d[:, None] // x) * stride_k_cache_d
-            + internal_offsets[None, :] * stride_k_cache_bl
-            + (offs_d[:, None] % x) * stride_k_cache_x
-        )
-
-        # Addressing of V (4D, or interleaved 5D mapped to flat)
-        if INTERLEAVED_V_KX > 0:
-            off_v = (
-                bn[:, None] * stride_v_cache_bs
-                + cur_kv_head * stride_v_cache_h
-                + (internal_offsets[:, None] // INTERLEAVED_V_KX)
-                * BLOCK_DMODEL
-                * INTERLEAVED_V_KX
-                + offs_d[None, :] * INTERLEAVED_V_KX
-                + (internal_offsets[:, None] % INTERLEAVED_V_KX)
+        if KV_CACHE_LAYOUT == 1:  # FLASH: K/V=[blocks,bs,heads,hd]
+            off_k = (
+                bn[None, :] * stride_k_cache_bs
+                + internal_offsets[None, :] * stride_k_cache_bl
+                + cur_kv_head * stride_k_cache_h
+                + offs_d[:, None] * stride_k_cache_x
             )
-        else:
             off_v = (
                 bn[:, None] * stride_v_cache_bs
+                + internal_offsets[:, None] * stride_v_cache_bl
                 + cur_kv_head * stride_v_cache_h
                 + offs_d[None, :] * stride_v_cache_d
-                + internal_offsets[:, None] * stride_v_cache_bl
             )
+        else:
+            # PAGED/SHUFFLE: K=[blocks,heads,hd/x,bs,x]
+            off_k = (
+                bn[None, :] * stride_k_cache_bs
+                + cur_kv_head * stride_k_cache_h
+                + (offs_d[:, None] // x) * stride_k_cache_d
+                + internal_offsets[None, :] * stride_k_cache_bl
+                + (offs_d[:, None] % x) * stride_k_cache_x
+            )
+            if INTERLEAVED_V_KX > 0:  # SHUFFLE V
+                off_v = (
+                    bn[:, None] * stride_v_cache_bs
+                    + cur_kv_head * stride_v_cache_h
+                    + (internal_offsets[:, None] // INTERLEAVED_V_KX)
+                    * BLOCK_DMODEL
+                    * INTERLEAVED_V_KX
+                    + offs_d[None, :] * INTERLEAVED_V_KX
+                    + (internal_offsets[:, None] % INTERLEAVED_V_KX)
+                )
+            else:  # PAGED V
+                off_v = (
+                    bn[:, None] * stride_v_cache_bs
+                    + cur_kv_head * stride_v_cache_h
+                    + offs_d[None, :] * stride_v_cache_d
+                    + internal_offsets[:, None] * stride_v_cache_bl
+                )
 
         if (
             start_n + BLOCK_SIZE > cur_batch_ctx_len
@@ -412,9 +425,9 @@ def _fwd_kernel_alibi(
     BLOCK_DMODEL_PADDED: tl.constexpr,  # head size padded to a power of 2
     BLOCK_N: tl.constexpr,
     SKIP_DECODE: tl.constexpr,
+    KV_CACHE_LAYOUT: tl.constexpr = 0,  # 0=PAGED, 1=FLASH, 2=SHUFFLE
     INTERLEAVED_V_KX: tl.constexpr = 0,
 ):
-    # attn_bias[]
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     start_m = tl.program_id(2)
@@ -474,29 +487,45 @@ def _fwd_kernel_alibi(
             mask=(start_n + offs_n) < cur_batch_ctx_len,
             other=0,
         ).to(tl.int64)
-        off_k = (
-            bn[None, :] * stride_k_cache_bs
-            + cur_kv_head * stride_k_cache_h
-            + (offs_d[:, None] // x) * stride_k_cache_d
-            + ((start_n + offs_n[None, :]) % block_size) * stride_k_cache_bl
-            + (offs_d[:, None] % x) * stride_k_cache_x
-        )
-        if INTERLEAVED_V_KX > 0:
-            v_internal = (start_n + offs_n[:, None]) % block_size
-            off_v = (
-                bn[:, None] * stride_v_cache_bs
-                + cur_kv_head * stride_v_cache_h
-                + (v_internal // INTERLEAVED_V_KX) * BLOCK_DMODEL * INTERLEAVED_V_KX
-                + offs_d[None, :] * INTERLEAVED_V_KX
-                + (v_internal % INTERLEAVED_V_KX)
+        k_internal = (start_n + offs_n[None, :]) % block_size
+        v_internal = (start_n + offs_n[:, None]) % block_size
+        if KV_CACHE_LAYOUT == 1:  # FLASH
+            off_k = (
+                bn[None, :] * stride_k_cache_bs
+                + k_internal * stride_k_cache_bl
+                + cur_kv_head * stride_k_cache_h
+                + offs_d[:, None] * stride_k_cache_x
             )
-        else:
             off_v = (
                 bn[:, None] * stride_v_cache_bs
+                + v_internal * stride_v_cache_bl
                 + cur_kv_head * stride_v_cache_h
                 + offs_d[None, :] * stride_v_cache_d
-                + (start_n + offs_n[:, None]) % block_size * stride_v_cache_bl
             )
+        else:
+            off_k = (
+                bn[None, :] * stride_k_cache_bs
+                + cur_kv_head * stride_k_cache_h
+                + (offs_d[:, None] // x) * stride_k_cache_d
+                + k_internal * stride_k_cache_bl
+                + (offs_d[:, None] % x) * stride_k_cache_x
+            )
+            if INTERLEAVED_V_KX > 0:  # SHUFFLE V
+                off_v = (
+                    bn[:, None] * stride_v_cache_bs
+                    + cur_kv_head * stride_v_cache_h
+                    + (v_internal // INTERLEAVED_V_KX)
+                    * BLOCK_DMODEL * INTERLEAVED_V_KX
+                    + offs_d[None, :] * INTERLEAVED_V_KX
+                    + (v_internal % INTERLEAVED_V_KX)
+                )
+            else:  # PAGED V
+                off_v = (
+                    bn[:, None] * stride_v_cache_bs
+                    + cur_kv_head * stride_v_cache_h
+                    + offs_d[None, :] * stride_v_cache_d
+                    + v_internal * stride_v_cache_bl
+                )
         k_load = tl.load(
             K_cache + off_k,
             mask=dim_mask[:, None] & ((start_n + offs_n[None, :]) < cur_batch_ctx_len),
@@ -679,6 +708,7 @@ def context_attention_fwd(
     fp8_out_scale=None,
     sinks=None,
     is_block_table_ptr: bool = False,
+    kv_cache_layout: int = 0,
     interleaved_v_kx: int = 0,
 ):
     q_dtype_is_f32 = q.dtype is torch.float32
@@ -745,6 +775,34 @@ def context_attention_fwd(
     else:
         processed_b_loc = b_loc.to(torch.int32)
 
+    # Compute layout-dependent strides and block sizes.
+    # FLASH: K/V = [blocks, bs, heads, hd]  (4D flat NHD)
+    # PAGED: K = [blocks, heads, hd/x, bs, x]  V = [blocks, heads, hd, bs]
+    # SHUFFLE: same K as PAGED, V = [blocks, heads, bs/x, hd, x]
+    if kv_cache_layout == 1:  # FLASH
+        x_val = 1
+        real_block_size = k_cache.shape[1]
+        sk_bs, sk_h, sk_d, sk_bl, sk_x = (
+            k_cache.stride(0), k_cache.stride(2),
+            0, k_cache.stride(1), k_cache.stride(3),
+        )
+        sv_bs, sv_h, sv_d, sv_bl = (
+            v_cache.stride(0), v_cache.stride(2),
+            v_cache.stride(3), v_cache.stride(1),
+        )
+    else:  # PAGED / SHUFFLE
+        x_val = k_cache.shape[4]
+        real_block_size = v_cache.shape[3]
+        sk_bs = k_cache.stride(0)
+        sk_h = k_cache.stride(1)
+        sk_d = k_cache.stride(2)
+        sk_bl = k_cache.stride(3)
+        sk_x = k_cache.stride(4)
+        sv_bs = v_cache.stride(0)
+        sv_h = v_cache.stride(1)
+        sv_d = v_cache.stride(2)
+        sv_bl = v_cache.stride(3)
+
     if alibi_slopes is not None:
         assert sinks is None, "Sinks arg is not supported with alibi"
         assert fp8_out_scale is None, "FP8 output not supported with alibi"
@@ -767,8 +825,8 @@ def context_attention_fwd(
             b_start_loc,
             b_seq_len,
             alibi_slopes,
-            v_cache.shape[3],
-            k_cache.shape[4],
+            real_block_size,
+            x_val,
             o,
             b_loc.stride(0),
             b_loc.stride(1),
@@ -784,15 +842,8 @@ def context_attention_fwd(
             o.stride(0),
             o.stride(1),
             o.stride(2),
-            k_cache.stride(0),
-            k_cache.stride(1),
-            k_cache.stride(2),
-            k_cache.stride(3),
-            k_cache.stride(4),  # [num_blocks, num_kv_heads, head_size/x, block_size, x]
-            v_cache.stride(0),
-            v_cache.stride(1),
-            v_cache.stride(2),
-            v_cache.stride(3),  # [num_blocks, num_kv_heads, head_size, block_size]
+            sk_bs, sk_h, sk_d, sk_bl, sk_x,
+            sv_bs, sv_h, sv_d, sv_bl,
             num_queries_per_kv=num_queries_per_kv,
             IN_PRECISION=IN_PRECISION,
             BLOCK_M=BLOCK,
@@ -800,6 +851,7 @@ def context_attention_fwd(
             BLOCK_DMODEL_PADDED=Lk_padded,
             BLOCK_N=BLOCK,
             SKIP_DECODE=skip_decode,
+            KV_CACHE_LAYOUT=kv_cache_layout,
             INTERLEAVED_V_KX=interleaved_v_kx,
             num_warps=NUM_WARPS,
             num_stages=1,
@@ -810,8 +862,6 @@ def context_attention_fwd(
     extra_kargs: dict[str, Any] = {}
     if current_platform.is_rocm():
         extra_kargs = {}
-
-    real_block_size = v_cache.shape[3]
     is_pow2 = real_block_size > 0 and (real_block_size & (real_block_size - 1) == 0)
     # For standard models involving powers of 2,
     # follow the original logic (Llama 128/64)
@@ -843,7 +893,7 @@ def context_attention_fwd(
         1.0 / fp8_out_scale if fp8_out_scale is not None else 1.0,
         b_start_loc,
         b_seq_len,
-        k_cache.shape[4],
+        x_val,
         o,
         processed_b_loc.stride(0),
         processed_b_loc.stride(1),
@@ -859,15 +909,15 @@ def context_attention_fwd(
         o.stride(0),
         o.stride(1),
         o.stride(2),
-        stride_k_cache_bs=k_cache.stride(0),
-        stride_k_cache_h=k_cache.stride(1),
-        stride_k_cache_d=k_cache.stride(2),
-        stride_k_cache_bl=k_cache.stride(3),
-        stride_k_cache_x=k_cache.stride(4),
-        stride_v_cache_bs=v_cache.stride(0),
-        stride_v_cache_h=v_cache.stride(1),
-        stride_v_cache_d=v_cache.stride(2),
-        stride_v_cache_bl=v_cache.stride(3),
+        stride_k_cache_bs=sk_bs,
+        stride_k_cache_h=sk_h,
+        stride_k_cache_d=sk_d,
+        stride_k_cache_bl=sk_bl,
+        stride_k_cache_x=sk_x,
+        stride_v_cache_bs=sv_bs,
+        stride_v_cache_h=sv_h,
+        stride_v_cache_d=sv_d,
+        stride_v_cache_bl=sv_bl,
         BLOCK_SIZE=TRITON_BLOCK_SIZE,
         PHYSICAL_BLOCK_SIZE=real_block_size,
         num_queries_per_kv=num_queries_per_kv,
@@ -884,6 +934,7 @@ def context_attention_fwd(
         num_warps=4,
         num_stages=1,
         USE_SINKS=sinks is not None,
+        KV_CACHE_LAYOUT=kv_cache_layout,
         INTERLEAVED_V_KX=interleaved_v_kx,
         **extra_kargs,
     )

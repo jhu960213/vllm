@@ -380,7 +380,9 @@ def test_qk_norm_rope_kvcache_fusion(
 
         torch.testing.assert_close(v_unfused, v_fused, atol=ATOL, rtol=RTOL)
 
-        uses_interleaved_v = getattr(model.attn.impl, "_use_interleaved_v_cache", False)
+        from vllm.v1.attention.backends.rocm_attn import KVCacheLayout
+        kv_layout = getattr(model.attn.impl, "_kv_cache_layout", KVCacheLayout.PAGED)
+        uses_interleaved_v = (kv_layout == KVCacheLayout.SHUFFLE)
         cache_atol = 5e-2 if is_fp8_cache else ATOL
         cache_rtol = 1.0 if is_fp8_cache else RTOL
 

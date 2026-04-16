@@ -277,7 +277,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
     def fused_rope_kvcache_supported(self):
         return rocm_aiter_ops.is_enabled()
 
-    def set_fused_kv_cache_layout(self):
+    def set_fused_kv_cache_layout(self, layout=None):
         # No-op: this backend uses AITER flash/unified attention for decode,
         # not the C++ HIP ASM paged attention kernel, so it does not need
         # the interleaved V-cache read path that the parent would enable.

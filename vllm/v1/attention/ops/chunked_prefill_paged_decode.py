@@ -68,6 +68,7 @@ def kernel_paged_attention_2d(
     query_start_len_ptr,  # [num_seqs+1]
     USE_SINKS: tl.constexpr,  # bool
     USE_FP8: tl.constexpr,
+    KV_CACHE_LAYOUT: tl.constexpr = 0,  # 0=PAGED, 1=FLASH, 2=SHUFFLE
     INTERLEAVED_V_KX: tl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -146,33 +147,45 @@ def kernel_paged_attention_2d(
         p_block_idx = tl.load(block_tables_ptr + block_table_offset + l_block_idx)
         internal_offsets = abs_token_idx % PHYSICAL_BLOCK_SIZE
 
-        # 5D addressing logic of K
-        k_offset = (
-            p_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_1
-            + (offs_d[:, None] // x) * stride_k_cache_2
-            + internal_offsets[None, :] * stride_k_cache_3
-            + (offs_d[:, None] % x) * stride_k_cache_4
-        )
-
-        # V addressing: standard 4D or interleaved 5D
-        if INTERLEAVED_V_KX > 0:
-            v_offset = (
-                p_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_1
-                + (internal_offsets[:, None] // INTERLEAVED_V_KX)
-                * HEAD_SIZE
-                * INTERLEAVED_V_KX
-                + offs_d[None, :] * INTERLEAVED_V_KX
-                + (internal_offsets[:, None] % INTERLEAVED_V_KX)
+        if KV_CACHE_LAYOUT == 1:  # FLASH: K/V=[blocks,bs,heads,hd]
+            k_offset = (
+                p_block_idx[None, :] * stride_k_cache_0
+                + internal_offsets[None, :] * stride_k_cache_3
+                + kv_head_idx * stride_k_cache_1
+                + offs_d[:, None] * stride_k_cache_4
             )
-        else:
             v_offset = (
                 p_block_idx[:, None] * stride_v_cache_0
+                + internal_offsets[:, None] * stride_v_cache_3
                 + kv_head_idx * stride_v_cache_1
                 + offs_d[None, :] * stride_v_cache_2
-                + internal_offsets[:, None] * stride_v_cache_3
             )
+        else:
+            # PAGED/SHUFFLE: K=[blocks,heads,hd/x,bs,x]
+            k_offset = (
+                p_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_1
+                + (offs_d[:, None] // x) * stride_k_cache_2
+                + internal_offsets[None, :] * stride_k_cache_3
+                + (offs_d[:, None] % x) * stride_k_cache_4
+            )
+            if KV_CACHE_LAYOUT == 2:  # SHUFFLE: V=[blocks,heads,bs/x,hd,x]
+                v_offset = (
+                    p_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_1
+                    + (internal_offsets[:, None] // INTERLEAVED_V_KX)
+                    * HEAD_SIZE
+                    * INTERLEAVED_V_KX
+                    + offs_d[None, :] * INTERLEAVED_V_KX
+                    + (internal_offsets[:, None] % INTERLEAVED_V_KX)
+                )
+            else:  # PAGED: V=[blocks,heads,hd,bs]
+                v_offset = (
+                    p_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_1
+                    + offs_d[None, :] * stride_v_cache_2
+                    + internal_offsets[:, None] * stride_v_cache_3
+                )
 
         # K : (HEAD_SIZE, BLOCK_SIZE)
         K_load = tl.load(
@@ -281,7 +294,7 @@ def chunked_prefill_paged_decode(
     # Optional tensor for sinks
     sinks=None,
     is_block_table_ptr: bool = False,
-    use_interleaved_v_cache: bool = False,
+    kv_cache_layout: int = 0,
 ):
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[2] ** 0.5)
@@ -291,9 +304,11 @@ def chunked_prefill_paged_decode(
     if sliding_window is None or sliding_window <= 0:
         sliding_window = 0
 
-    interleaved_v_kx = (
-        (16 // value_cache.element_size()) if use_interleaved_v_cache else 0
-    )
+    # KV_CACHE_LAYOUT: 0=PAGED, 1=FLASH, 2=SHUFFLE
+    if kv_cache_layout == 2:  # SHUFFLE
+        interleaved_v_kx = 16 // value_cache.element_size()
+    else:
+        interleaved_v_kx = 0
 
     if max_query_len > 1:
         context_attention_fwd(
@@ -317,14 +332,22 @@ def chunked_prefill_paged_decode(
             skip_decode=True,
             fp8_out_scale=output_scale,
             sinks=sinks,
+            kv_cache_layout=kv_cache_layout,
             interleaved_v_kx=interleaved_v_kx,
         )
 
-    block_size = value_cache.shape[3]
+    if kv_cache_layout == 1:  # FLASH: [blocks, bs, heads, hd]
+        block_size = key_cache.shape[1]
+    else:  # PAGED/SHUFFLE: value_cache is [blocks, heads, hd, bs]
+        block_size = value_cache.shape[3]
     num_seqs = len(seq_lens)
     num_query_heads = query.shape[1]
-    # key may be None in cross-attention decode (already cached from encoder)
-    num_kv_heads = key.shape[1] if key is not None else key_cache.shape[1]
+    if key is not None:
+        num_kv_heads = key.shape[1]
+    elif kv_cache_layout == 1:  # FLASH: [blocks, bs, heads, hd]
+        num_kv_heads = key_cache.shape[2]
+    else:  # PAGED/SHUFFLE: [blocks, heads, ...]
+        num_kv_heads = key_cache.shape[1]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = query.shape[2]
 
@@ -371,7 +394,6 @@ def chunked_prefill_paged_decode(
     is_pow2 = block_size > 0 and (block_size & (block_size - 1) == 0)
     if not is_pow2:
         use_custom = False
-
     if use_custom:
         _PARTITION_SIZE_ROCM = 256
         max_num_partitions = (
@@ -411,16 +433,17 @@ def chunked_prefill_paged_decode(
             k_scale=k_scale,
             v_scale=v_scale,
             fp8_out_scale=output_scale,
-            use_interleaved_v_cache=use_interleaved_v_cache,
+            kv_cache_layout=kv_cache_layout,
         )
     else:
         logger.warning_once(
             "Cannot use ROCm custom paged attention kernel,"
             " falling back to Triton implementation."
         )
-        real_block_size = value_cache.shape[3]
-        # The standard model directly uses the original block_size.
-        # Non-standard 544 uses 32 to accommodate integer division logic.
+        if kv_cache_layout == 1:  # FLASH: [blocks, bs, heads, hd]
+            real_block_size = key_cache.shape[1]
+        else:
+            real_block_size = value_cache.shape[3]
         TRITON_BLOCK_SIZE = block_size if is_pow2 else 32
         if is_block_table_ptr:
             # Using the physical base address of tensors
@@ -436,6 +459,28 @@ def chunked_prefill_paged_decode(
             )
         else:
             processed_block_table = block_table.to(torch.int32)
+
+        if kv_cache_layout == 1:  # FLASH: K/V are [blocks, bs, heads, hd]
+            x_val = 1
+            sk0, sk1, sk2, sk3, sk4 = (
+                key_cache.stride(0), key_cache.stride(2),
+                0, key_cache.stride(1), key_cache.stride(3),
+            )
+            sv0, sv1, sv2, sv3 = (
+                value_cache.stride(0), value_cache.stride(2),
+                value_cache.stride(3), value_cache.stride(1),
+            )
+        else:  # PAGED/SHUFFLE: K=[blocks,heads,hd/x,bs,x] V=[blocks,heads,hd,bs]
+            x_val = key_cache.shape[4]
+            sk0 = key_cache.stride(0)
+            sk1 = key_cache.stride(1)
+            sk2 = key_cache.stride(2)
+            sk3 = key_cache.stride(3)
+            sk4 = key_cache.stride(4)
+            sv0 = value_cache.stride(0)
+            sv1 = value_cache.stride(1)
+            sv2 = value_cache.stride(2)
+            sv3 = value_cache.stride(3)
 
         kernel_paged_attention_2d[
             (
@@ -469,19 +514,20 @@ def chunked_prefill_paged_decode(
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             USE_ALIBI_SLOPES=use_alibi_slopes,
             SLIDING_WINDOW=sliding_window,
-            x=key_cache.shape[4],
-            stride_k_cache_0=key_cache.stride(0),
-            stride_k_cache_1=key_cache.stride(1),
-            stride_k_cache_2=key_cache.stride(2),
-            stride_k_cache_3=key_cache.stride(3),
-            stride_k_cache_4=key_cache.stride(4),
-            stride_v_cache_0=value_cache.stride(0),
-            stride_v_cache_1=value_cache.stride(1),
-            stride_v_cache_2=value_cache.stride(2),
-            stride_v_cache_3=value_cache.stride(3),
+            x=x_val,
+            stride_k_cache_0=sk0,
+            stride_k_cache_1=sk1,
+            stride_k_cache_2=sk2,
+            stride_k_cache_3=sk3,
+            stride_k_cache_4=sk4,
+            stride_v_cache_0=sv0,
+            stride_v_cache_1=sv1,
+            stride_v_cache_2=sv2,
+            stride_v_cache_3=sv3,
             filter_by_query_len=True,
             query_start_len_ptr=query_start_loc,
             USE_SINKS=sinks is not None,
             USE_FP8=output_scale is not None,
+            KV_CACHE_LAYOUT=kv_cache_layout,
             INTERLEAVED_V_KX=interleaved_v_kx,
         )

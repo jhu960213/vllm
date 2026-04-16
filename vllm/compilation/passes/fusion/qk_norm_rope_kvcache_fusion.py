@@ -361,10 +361,20 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
         if rocm_aiter_ops.is_triton_rotary_embed_enabled():
             aiter_rope_variants.append(True)
 
+        # Resolve the configured KV cache layout for ROCM_ATTN.
+        from vllm.v1.attention.backends.rocm_attn import KVCacheLayout
+        layout_str = cc.pass_config.kv_cache_layout.lower()
+        if layout_str in ("flash", "1"):
+            requested_layout = KVCacheLayout.FLASH
+        elif layout_str in ("shuffle", "interleaved", "2"):
+            requested_layout = KVCacheLayout.SHUFFLE
+        else:
+            requested_layout = None
+
         for _, layer in attn_layers.items():
             if not layer.impl.fused_qk_norm_rope_kvcache_supported():
                 continue
-            layer.impl.set_fused_kv_cache_layout()
+            layer.impl.set_fused_kv_cache_layout(requested_layout)
             for aiter_rms in aiter_rms_variants:
                 for aiter_rope in aiter_rope_variants:
                     for epsilon in [1e-5, 1e-6]:
@@ -417,15 +427,19 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
                                     else:
                                         raise
 
-        # Backends that set _use_interleaved_v_cache (e.g. ROCM_ATTN)
-        # require a consistent V-cache layout across ALL compile ranges.
-        # If max_token_num is too small, unfused ranges would write
-        # standard-layout V while the attention kernel reads interleaved,
-        # corrupting long-sequence generation.  Force fusion to cover all
-        # ranges so both write and read paths agree on the layout.
+        # Backends using SHUFFLE layout (kv_cache_layout==2) require a
+        # consistent V-cache layout across ALL compile ranges.  The unfused
+        # path cannot write shuffle/interleaved V, so if max_token_num is
+        # too small, unfused ranges would write standard-layout V while the
+        # attention kernel reads interleaved, corrupting generation.
+        # Force fusion to cover all ranges when SHUFFLE is active.
+        # FLASH layout (kv_cache_layout==1) does NOT need this because the
+        # unfused path can also write flash layout via reshape_and_cache_flash.
+        from vllm.v1.attention.backends.rocm_attn import KVCacheLayout
         max_batched = config.scheduler_config.max_num_batched_tokens
         needs_full_coverage = any(
-            getattr(layer.impl, "_use_interleaved_v_cache", False)
+            getattr(layer.impl, "_kv_cache_layout", KVCacheLayout.PAGED)
+            == KVCacheLayout.SHUFFLE
             for _, layer in attn_layers.items()
             if layer.impl.fused_qk_norm_rope_kvcache_supported()
         )
@@ -436,7 +450,7 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
         ):
             logger.info(
                 "Raising rope_kvcache_fusion_max_token_num from %d to %d "
-                "to maintain consistent interleaved V-cache layout across "
+                "to maintain consistent shuffle V-cache layout across "
                 "all compile ranges (required by attention backend).",
                 self.max_token_num,
                 max_batched,

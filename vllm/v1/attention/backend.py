@@ -800,10 +800,15 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         """
         return False
 
-    def set_fused_kv_cache_layout(self):
+    def set_fused_kv_cache_layout(self, layout=None):
         """Called by the fusion pass after confirming this layer will use
         the fused kernel. Backends that need to adjust their KV cache read
-        path (e.g. permute strides) should override this."""
+        path (e.g. permute strides) should override this.
+
+        Args:
+            layout: Optional KVCacheLayout enum value specifying the desired
+                cache layout. If None, the backend picks its default.
+        """
         pass
 
     def fused_rope_kvcache_supported(self):

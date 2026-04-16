@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with PagedAttention and Triton prefix prefill."""
 
+import enum
 import math
 from dataclasses import dataclass
 from typing import ClassVar
@@ -39,6 +40,20 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+
+
+class KVCacheLayout(enum.IntEnum):
+    """KV cache memory layout for ROCM_ATTN read/write paths.
+
+    The fused AITER kernel can write either FLASH or SHUFFLE layout.
+    The unfused path can write either PAGED or FLASH layout.
+    All compile ranges must use a consistent layout.
+
+    Values are passed as compile-time constants to C++/Triton kernels.
+    """
+    PAGED = 0       # K=[blocks,heads,hd/x,bs,x]  V=[blocks,heads,hd,bs]
+    FLASH = 1       # K/V=[blocks,bs,heads,hd]  (flat NHD per page)
+    SHUFFLE = 2     # K=[blocks,heads,hd/x,bs,x]  V=[blocks,heads,bs/x,hd,x]
 
 
 @dataclass
@@ -296,7 +311,7 @@ class RocmAttentionImpl(AttentionImpl):
                 f"num_heads: {num_heads}."
             )
 
-        self._use_interleaved_v_cache = False
+        self._kv_cache_layout = KVCacheLayout.PAGED
 
         self._cached_k_scale_val: float | None = None
         self._cached_k_scale_cpu: torch.Tensor | None = None
@@ -408,11 +423,14 @@ class RocmAttentionImpl(AttentionImpl):
                 layer,
             )
 
-        key_cache, value_cache = PagedAttention.split_kv_cache(
-            kv_cache,
-            self.num_kv_heads,
-            self.head_size,
-        )
+        if self._kv_cache_layout == KVCacheLayout.FLASH:
+            key_cache, value_cache = kv_cache.unbind(0)
+        else:
+            key_cache, value_cache = PagedAttention.split_kv_cache(
+                kv_cache,
+                self.num_kv_heads,
+                self.head_size,
+            )
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
             key_cache = key_cache.view(self.fp8_dtype)
@@ -427,7 +445,6 @@ class RocmAttentionImpl(AttentionImpl):
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
 
-        # Compute attention and update output up to `num_actual_tokens`.
         chunked_prefill_paged_decode(
             query=query[:num_actual_tokens],
             key=key[:num_actual_tokens] if key is not None else None,
@@ -448,7 +465,7 @@ class RocmAttentionImpl(AttentionImpl):
             sm_scale=self.scale,
             output_scale=output_scale,
             sinks=self.sinks,
-            use_interleaved_v_cache=self._use_interleaved_v_cache,
+            kv_cache_layout=self._kv_cache_layout,
         )
 
         return output
@@ -463,18 +480,10 @@ class RocmAttentionImpl(AttentionImpl):
     ):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return
-        key_cache, value_cache = PagedAttention.split_kv_cache(
-            kv_cache, self.num_kv_heads, self.head_size
-        )
 
-        # Reshape the input keys and values and store them in the cache.
-        # Get the actual block_size from value_cache
-        # value_cache shape: [num_blocks, num_heads, head_size, block_size]
-        block_size = value_cache.shape[3]
-
-        if block_size in (16, 32):
-            # Normal 16, 32, use vLLM native HIP C++ logic
-            PagedAttention.write_to_paged_cache(
+        if self._kv_cache_layout == KVCacheLayout.FLASH:
+            key_cache, value_cache = kv_cache.unbind(0)
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key,
                 value,
                 key_cache,
@@ -485,24 +494,42 @@ class RocmAttentionImpl(AttentionImpl):
                 layer._v_scale,
             )
         else:
-            # Case B: Non-standard blocks (e.g., 64, 128, 544 in Qwen3Next or Qwen3.5 ),
-            # force using our modified Triton logic
-            triton_reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
+            key_cache, value_cache = PagedAttention.split_kv_cache(
+                kv_cache, self.num_kv_heads, self.head_size
             )
+            block_size = value_cache.shape[3]
+
+            if block_size in (16, 32):
+                PagedAttention.write_to_paged_cache(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+            else:
+                triton_reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
     def fused_qk_norm_rope_kvcache_supported(self):
         return rocm_aiter_ops.is_enabled()
 
-    def set_fused_kv_cache_layout(self):
-        self._use_interleaved_v_cache = True
+    def set_fused_kv_cache_layout(self, layout: "KVCacheLayout | None" = None):
+        if layout is not None:
+            self._kv_cache_layout = layout
+        else:
+            self._kv_cache_layout = KVCacheLayout.SHUFFLE
 
     def do_qk_norm_rope_kvcache_update(
         self,
@@ -531,7 +558,7 @@ class RocmAttentionImpl(AttentionImpl):
         num_heads_v = self.num_kv_heads
         head_dim = self.head_size
         use_shuffle_layout = (
-            self._use_interleaved_v_cache
+            self._kv_cache_layout == KVCacheLayout.SHUFFLE
             or rocm_aiter_ops.is_shuffle_kv_cache_enabled()
         )
         block_size = key_cache.shape[1]
@@ -597,12 +624,16 @@ class RocmAttentionImpl(AttentionImpl):
     ):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return
-        key_cache, value_cache = PagedAttention.split_kv_cache(
-            kv_cache,
-            layer.num_kv_heads,  # type: ignore[attr-defined]
-            layer.head_size,  # type: ignore[attr-defined]
-        )
-        flash_layout = False
+        if self._kv_cache_layout == KVCacheLayout.FLASH:
+            key_cache, value_cache = kv_cache.unbind(0)
+            flash_layout = True
+        else:
+            key_cache, value_cache = PagedAttention.split_kv_cache(
+                kv_cache,
+                layer.num_kv_heads,  # type: ignore[attr-defined]
+                layer.head_size,  # type: ignore[attr-defined]
+            )
+            flash_layout = False
 
         is_fp8_kv_cache = is_quantized_kv_cache(self.kv_cache_dtype)
         if is_fp8_kv_cache:

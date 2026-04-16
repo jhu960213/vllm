@@ -156,6 +156,19 @@ class PassConfig:
     Also applies to the fused QK-Norm+RoPE+KVCache pass.
     """
 
+    kv_cache_layout: str = "shuffle"
+    """KV cache memory layout for ROCM_ATTN when fusion is active.
+    'flash':   K/V stored as [blocks, bs, heads, hd] (flat NHD per page).
+               Both fused and unfused paths can write this layout, so no
+               auto-bump of rope_kvcache_fusion_max_token_num is needed.
+    'shuffle': K=[blocks,heads,hd/x,bs,x], V=[blocks,heads,bs/x,hd,x]
+               (interleaved). May improve decode throughput on GFX9 (MI300x).
+               Requires auto-bump so all compile ranges use the fused path.
+               Not supported on NAVI GPUs.
+    Only takes effect when fuse_qk_norm_rope_kvcache or fuse_rope_kvcache
+    is enabled and the backend is ROCM_ATTN.
+    """
+
     fi_allreduce_fusion_max_size_mb: float | None = None
     """The threshold of the communicated tensor sizes under which
     vllm should use flashinfer fused allreduce. Specified as a
