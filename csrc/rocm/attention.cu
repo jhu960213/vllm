@@ -120,18 +120,23 @@ using _B8x8_native_i32 =
 
 // 4-way transpose for 16-bit elements (bf16 / f16).
 // Groups of 4 lanes each return 4 × 16-bit elements per lane.
+//
+// The clang builtin signature is `V4s V4s*3` (non-const pointer in addrspace
+// 3). We accept a `const bit16_t*` for caller convenience and strip the
+// const here — the underlying ds_read_b64_tr_b16 hardware op is purely a
+// load and does not modify LDS, so the const cast is semantically safe.
 __device__ __forceinline__ _B16x4 ds_read_tr16_b64(const bit16_t* lds_ptr) {
   _B16x4_native_i16 v = __builtin_amdgcn_ds_read_tr16_b64_v4i16(
-      reinterpret_cast<const _B16x4_native_i16*>(lds_ptr));
+      reinterpret_cast<_B16x4_native_i16*>(const_cast<bit16_t*>(lds_ptr)));
   return *reinterpret_cast<_B16x4*>(&v);
 }
 
 // 8-way transpose for 8-bit elements (fp8 / e4m3 / e5m2).
 // Groups of 8 lanes each return 8 × 8-bit elements per lane (returned as
-// _B8x8 = uint2 = 8 bytes).
+// _B8x8 = uint2 = 8 bytes). Same const-strip rationale as ds_read_tr16_b64.
 __device__ __forceinline__ _B8x8 ds_read_tr8_b64(const bit8_t* lds_ptr) {
   _B8x8_native_i32 v = __builtin_amdgcn_ds_read_tr8_b64_v2i32(
-      reinterpret_cast<const _B8x8_native_i32*>(lds_ptr));
+      reinterpret_cast<_B8x8_native_i32*>(const_cast<bit8_t*>(lds_ptr)));
   return *reinterpret_cast<_B8x8*>(&v);
 }
 #else
