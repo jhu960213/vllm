@@ -1450,7 +1450,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
         is_neox: bool,
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
+        attn_metadata=None,
     ):
+        # rocm_aiter_fa goes through AITER which handles its own per-token
+        # slot logic; ``attn_metadata`` is unused here.
+        del attn_metadata
         key_cache, value_cache = kv_cache.unbind(0)
 
         is_fp8_kv_cache = self.kv_cache_dtype.startswith("fp8")

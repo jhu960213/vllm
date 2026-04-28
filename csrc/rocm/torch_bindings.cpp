@@ -59,6 +59,30 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                str mfma_type,"
       "                int kv_cache_layout) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+  // Fused QK-norm + RoPE + per-tensor-quant + KV-cache update.
+  // vLLM-native port of AITER's fused_qk_norm_rope_cache_pts_quant_shuffle,
+  // adding the dim-major LDS staging fast path on the SHUFFLE write layout.
+  rocm_ops.def(
+      "fused_qk_norm_rope_cache(Tensor! qkv, Tensor q_weight, Tensor k_weight,"
+      "                         Tensor cos_sin_cache, Tensor positions,"
+      "                         int num_heads_q, int num_heads_k,"
+      "                         int num_heads_v, int head_dim,"
+      "                         bool is_neox, float eps,"
+      "                         Tensor! q_out,"
+      "                         Tensor! k_cache, Tensor! v_cache,"
+      "                         Tensor slot_mapping,"
+      "                         Tensor query_start_loc,"
+      "                         Tensor block_to_seq,"
+      "                         Tensor block_to_group_in_seq,"
+      "                         Tensor per_tensor_k_scale,"
+      "                         Tensor per_tensor_v_scale,"
+      "                         str kv_cache_dtype,"
+      "                         Tensor!? k_out, Tensor!? v_out,"
+      "                         bool return_kv, bool use_shuffle_layout,"
+      "                         int block_size, int x) -> ()");
+  rocm_ops.impl("fused_qk_norm_rope_cache", torch::kCUDA,
+                &fused_qk_norm_rope_cache);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

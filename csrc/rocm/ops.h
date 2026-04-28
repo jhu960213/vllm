@@ -2,6 +2,8 @@
 
 #include <torch/all.h>
 
+#include "qk_norm_rope_cache.h"
+
 torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
                     const int64_t rows_per_block);
 

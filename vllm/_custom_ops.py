@@ -199,6 +199,80 @@ def paged_attention_v2(
     )
 
 
+def fused_qk_norm_rope_cache(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    is_neox: bool,
+    eps: float,
+    q_out: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    block_to_seq: torch.Tensor,
+    block_to_group_in_seq: torch.Tensor,
+    per_tensor_k_scale: torch.Tensor,
+    per_tensor_v_scale: torch.Tensor,
+    kv_cache_dtype: str,
+    k_out: torch.Tensor | None = None,
+    v_out: torch.Tensor | None = None,
+    return_kv: bool = True,
+    use_shuffle_layout: bool = True,
+    block_size: int = 16,
+    x: int = 8,
+) -> None:
+    """Fused QK-norm + RoPE + per-tensor quant + KV-cache update.
+
+    vLLM-native ROCm port of AITER's
+    ``fused_qk_norm_rope_cache_pts_quant_shuffle`` with the dim-major LDS
+    staging fast path on the SHUFFLE write layout.
+
+    The fast path triggers per-block when (slot_first % 8 == 0) AND
+    (group has 8 real tokens). Otherwise the kernel takes a fallback path
+    that is bit-identical to AITER's existing per-warp scalar shuffle.
+
+    ``block_to_seq`` and ``block_to_group_in_seq`` are int32 workspace tensors
+    of length ``total_kv_blocks = sum_seqs(ceil(seq_query_len / 8))``, built on
+    host in O(num_seqs) from ``query_start_loc``.
+    """
+    torch.ops._rocm_C.fused_qk_norm_rope_cache(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        is_neox,
+        eps,
+        q_out,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        query_start_loc,
+        block_to_seq,
+        block_to_group_in_seq,
+        per_tensor_k_scale,
+        per_tensor_v_scale,
+        kv_cache_dtype,
+        k_out,
+        v_out,
+        return_kv,
+        use_shuffle_layout,
+        block_size,
+        x,
+    )
+
+
 def paged_attention_rocm(
     out: torch.Tensor,
     exp_sum: torch.Tensor,

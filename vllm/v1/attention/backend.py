@@ -833,12 +833,18 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         is_neox: bool,
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
+        attn_metadata: Any | None = None,
     ):
         """
         If `fused_qk_norm_rope_kvcache_supported` returns True, this method
         will be called by the fused custom op. Applies QK-norm + RoPE and
         writes K/V to the KV cache. Results are written to the pre-allocated
         q_out and k_out tensors; V is split from QKV at the graph level.
+
+        ``attn_metadata`` is the per-step attention metadata for this layer;
+        backends that need per-sequence boundaries (e.g. for the vLLM-native
+        ROCm fast path) read ``query_start_loc`` from it. Optional for backward
+        compatibility with backends that don't need it.
         """
         raise NotImplementedError
 

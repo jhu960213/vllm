@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_ROCM_USE_AITER_QK_NORM_ROPE_CACHE: bool = False
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
@@ -1004,6 +1005,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+    ),
+    # Whether to fall back to AITER's
+    # `fused_qk_norm_rope_cache_pts_quant_shuffle` instead of the vLLM-native
+    # ROCm `fused_qk_norm_rope_cache` op (with the dim-major LDS staging fast
+    # path on the SHUFFLE write layout). By default disabled — the vLLM-native
+    # op is the production path; set to 1 to revert to AITER for stabilization.
+    "VLLM_ROCM_USE_AITER_QK_NORM_ROPE_CACHE": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_QK_NORM_ROPE_CACHE", "False").lower()
+        in ("true", "1")
     ),
     # Whether to use aiter fp4 gemm asm.
     # By default is disabled.

@@ -44,7 +44,9 @@ def fused_qk_norm_rope_and_unified_kv_cache_update_impl(
     is_neox: bool,
     layer_name: str = "",
 ) -> torch.Tensor:
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
     if layer_slot_mapping is not None:
         attn_layer.impl.do_qk_norm_rope_kvcache_update(
             attn_layer,
@@ -59,6 +61,7 @@ def fused_qk_norm_rope_and_unified_kv_cache_update_impl(
             is_neox,
             kv_cache,
             layer_slot_mapping,
+            attn_metadata=attn_metadata,
         )
 
     return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
@@ -387,6 +390,20 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
             )
             self.max_token_num = max_batched
 
+        # The vLLM-native ROCm `fused_qk_norm_rope_cache` op's per-block fast
+        # path requires every 8-token group to start at a mod-8-aligned slot.
+        # Since vLLM allocates cache in 16-slot blocks, this holds iff
+        # chunked-prefill chunk sizes are multiples of 8. All vLLM v1 default
+        # chunk sizes (256, 512, 2048, 8192) already satisfy this; we assert
+        # to catch regressions in custom configs.
+        if needs_full_coverage and max_batched is not None and max_batched % 8 != 0:
+            logger.warning(
+                "max_num_batched_tokens=%d is not a multiple of 8. The "
+                "vLLM rocm fused_qk_norm_rope_cache fast path will degrade "
+                "to its (still bit-exact) fallback for unaligned chunk tails.",
+                max_batched,
+            )
+
         self.dump_patterns(config, self.patterns)
 
     @VllmInductorPass.time_and_log
@@ -405,7 +422,8 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
 
         logger.info(
             "QK-Norm+RoPE+KVCache fusion: replaced %s pattern(s) "
-            "with AITER fused_qk_norm_rope_cache_pts_quant_shuffle",
+            "with vLLM rocm fused_qk_norm_rope_cache "
+            "(AITER fallback gated by VLLM_ROCM_USE_AITER_QK_NORM_ROPE_CACHE)",
             self.matched_count,
         )
 
