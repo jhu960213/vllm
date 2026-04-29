@@ -42,53 +42,12 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
-_GROUP_SIZE = 8  # KV-kernel group size; matches the bench-validated dim-major
-# LDS staging path. See csrc/rocm/qk_norm_rope_cache.cu.
-
-
-def _build_kv_block_to_seq(
-    query_start_loc: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the per-(kv-kernel-block) (seq_idx, group_idx_in_seq) workspace.
-
-    The vLLM-native ``fused_qk_norm_rope_cache`` op runs one CUDA block per
-    8-token group within a single sequence (per kv head). To avoid an in-kernel
-    binary search of ``query_start_loc``, we precompute two int32 arrays of
-    length ``total_kv_blocks = sum_seqs(ceil(seq_query_len / 8))``:
-
-    * ``block_to_seq[k]`` = the seq index that owns kv-kernel block ``k``.
-    * ``block_to_group_in_seq[k]`` = ``k - first_kv_block_of(seq)``,
-      i.e. the group index within that seq.
-
-    Returns:
-        (block_to_seq, block_to_group_in_seq), both int32 on the same device
-        as ``query_start_loc``.
-    """
-    if query_start_loc.dtype != torch.int64:
-        qsl = query_start_loc.to(torch.int64)
-    else:
-        qsl = query_start_loc
-    seq_lens = qsl[1:] - qsl[:-1]
-    groups_per_seq = (seq_lens + (_GROUP_SIZE - 1)) // _GROUP_SIZE  # ceil
-    num_seqs = seq_lens.shape[0]
-    device = qsl.device
-
-    seq_indices = torch.arange(num_seqs, device=device, dtype=torch.int64)
-    block_to_seq_i64 = torch.repeat_interleave(seq_indices, groups_per_seq)
-    total_kv_blocks = block_to_seq_i64.shape[0]
-
-    seq_first_block = torch.cumsum(groups_per_seq, dim=0) - groups_per_seq
-    block_indices = torch.arange(
-        total_kv_blocks, device=device, dtype=torch.int64
-    )
-    block_to_group_in_seq_i64 = (
-        block_indices - seq_first_block[block_to_seq_i64]
-    )
-
-    return (
-        block_to_seq_i64.to(torch.int32),
-        block_to_group_in_seq_i64.to(torch.int32),
-    )
+# NOTE: the prior _build_kv_block_to_seq workspace builder was removed in
+# favor of a flat-grid kernel design. The kernel now derives group identity
+# from blockIdx.x directly and probes slot_mapping for fast-path eligibility,
+# so no per-step (block_to_seq, block_to_group_in_seq, query_start_loc_i32)
+# workspace is needed. This eliminates the value-dependent CPU<->GPU sync
+# that previously caused the residual mid-forward-pass stall.
 
 
 class KVCacheLayout(enum.IntEnum):
@@ -596,6 +555,12 @@ class RocmAttentionImpl(AttentionImpl):
         layer_slot_mapping: torch.Tensor,
         attn_metadata=None,
     ):
+        # attn_metadata is no longer needed by the vLLM-native fused kernel
+        # — the kernel derives everything it needs (group identity,
+        # alignment, num_real) from slot_mapping directly. Argument is kept
+        # for backward compatibility with the AttentionImpl interface.
+        del attn_metadata
+
         import vllm.envs as envs
         from vllm import _custom_ops as ops
 
@@ -634,18 +599,11 @@ class RocmAttentionImpl(AttentionImpl):
             self._cached_v_scale_cpu = torch.tensor(v_scale_val, dtype=torch.float32)
             self._cached_v_scale_val = v_scale_val
 
-        # Decide between the vLLM-native ROCm op and the AITER fallback.
-        # The vLLM op needs per-sequence boundaries (query_start_loc) to build
-        # the per-seq KV grid. If unavailable (or the AITER override flag is
-        # set), fall back to the AITER call site.
-        query_start_loc = (
-            getattr(attn_metadata, "query_start_loc", None)
-            if attn_metadata is not None
-            else None
-        )
+        # Choose between the vLLM-native ROCm op and the AITER fallback.
+        # Both paths now have identical host-side argument shapes — the
+        # vLLM op no longer needs query_start_loc.
         use_aiter_fallback = (
             envs.VLLM_ROCM_USE_AITER_QK_NORM_ROPE_CACHE
-            or query_start_loc is None
             or head_dim not in (64, 128)
         )
 
@@ -677,12 +635,6 @@ class RocmAttentionImpl(AttentionImpl):
             )
             return
 
-        # vLLM-native path: build per-block (seq_idx, group_in_seq) workspace
-        # from query_start_loc and dispatch the new op.
-        block_to_seq, block_to_group_in_seq = _build_kv_block_to_seq(
-            query_start_loc
-        )
-
         ops.fused_qk_norm_rope_cache(
             qkv=qkv,
             q_weight=q_weight,
@@ -699,9 +651,6 @@ class RocmAttentionImpl(AttentionImpl):
             k_cache=key_cache,
             v_cache=value_cache,
             slot_mapping=layer_slot_mapping,
-            query_start_loc=query_start_loc.to(torch.int32),
-            block_to_seq=block_to_seq,
-            block_to_group_in_seq=block_to_group_in_seq,
             per_tensor_k_scale=self._cached_k_scale_cpu,
             per_tensor_v_scale=self._cached_v_scale_cpu,
             kv_cache_dtype=self.kv_cache_dtype,

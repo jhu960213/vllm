@@ -219,7 +219,6 @@ def _call_vllm(
 ):
     """Run the new vLLM-native ROCm op on a fresh cache buffer."""
     from vllm import _custom_ops as ops
-    from vllm.v1.attention.backends.rocm_attn import _build_kv_block_to_seq
 
     qkv = inp["qkv"].clone()
     k_cache = torch.zeros_like(inp["k_cache"])
@@ -234,10 +233,6 @@ def _call_vllm(
     )
     k_scale = torch.tensor(0.5, dtype=torch.float32)
     v_scale = torch.tensor(0.5, dtype=torch.float32)
-
-    block_to_seq, block_to_group_in_seq = _build_kv_block_to_seq(
-        inp["query_start_loc"]
-    )
 
     ops.fused_qk_norm_rope_cache(
         qkv=qkv,
@@ -255,9 +250,6 @@ def _call_vllm(
         k_cache=k_cache,
         v_cache=v_cache,
         slot_mapping=inp["slot_mapping"],
-        query_start_loc=inp["query_start_loc"],
-        block_to_seq=block_to_seq,
-        block_to_group_in_seq=block_to_group_in_seq,
         per_tensor_k_scale=k_scale,
         per_tensor_v_scale=v_scale,
         kv_cache_dtype=inp["kv_cache_dtype"],
@@ -536,7 +528,6 @@ def _make_vllm_runner(
 ):
     """Build a closure that runs the new vLLM op into pre-allocated outputs."""
     from vllm import _custom_ops as ops
-    from vllm.v1.attention.backends.rocm_attn import _build_kv_block_to_seq
 
     qkv_orig = inp["qkv"]
     qkv = qkv_orig.clone()
@@ -548,9 +539,6 @@ def _make_vllm_runner(
     )
     k_scale = torch.tensor(0.5, dtype=torch.float32)
     v_scale = torch.tensor(0.5, dtype=torch.float32)
-    block_to_seq, block_to_group_in_seq = _build_kv_block_to_seq(
-        inp["query_start_loc"]
-    )
 
     def run():
         qkv.copy_(qkv_orig)
@@ -561,9 +549,6 @@ def _make_vllm_runner(
             num_heads_v=num_heads_k, head_dim=head_dim, is_neox=is_neox,
             eps=eps, q_out=q_out, k_cache=k_cache, v_cache=v_cache,
             slot_mapping=inp["slot_mapping"],
-            query_start_loc=inp["query_start_loc"],
-            block_to_seq=block_to_seq,
-            block_to_group_in_seq=block_to_group_in_seq,
             per_tensor_k_scale=k_scale, per_tensor_v_scale=v_scale,
             kv_cache_dtype=inp["kv_cache_dtype"], k_out=None, v_out=None,
             return_kv=False, use_shuffle_layout=use_shuffle,

@@ -63,6 +63,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // Fused QK-norm + RoPE + per-tensor-quant + KV-cache update.
   // vLLM-native port of AITER's fused_qk_norm_rope_cache_pts_quant_shuffle,
   // adding the dim-major LDS staging fast path on the SHUFFLE write layout.
+  // Uses slot_mapping directly to derive group-to-cache addressing — no
+  // per-sequence workspace tensors required (matches AITER's flat-grid host
+  // path; eliminates a value-dependent CPU<->GPU sync per forward pass).
   rocm_ops.def(
       "fused_qk_norm_rope_cache(Tensor! qkv, Tensor q_weight, Tensor k_weight,"
       "                         Tensor cos_sin_cache, Tensor positions,"
@@ -72,9 +75,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                         Tensor! q_out,"
       "                         Tensor! k_cache, Tensor! v_cache,"
       "                         Tensor slot_mapping,"
-      "                         Tensor query_start_loc,"
-      "                         Tensor block_to_seq,"
-      "                         Tensor block_to_group_in_seq,"
       "                         Tensor per_tensor_k_scale,"
       "                         Tensor per_tensor_v_scale,"
       "                         str kv_cache_dtype,"

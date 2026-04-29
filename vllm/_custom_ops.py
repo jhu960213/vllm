@@ -215,9 +215,6 @@ def fused_qk_norm_rope_cache(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    block_to_seq: torch.Tensor,
-    block_to_group_in_seq: torch.Tensor,
     per_tensor_k_scale: torch.Tensor,
     per_tensor_v_scale: torch.Tensor,
     kv_cache_dtype: str,
@@ -234,13 +231,15 @@ def fused_qk_norm_rope_cache(
     ``fused_qk_norm_rope_cache_pts_quant_shuffle`` with the dim-major LDS
     staging fast path on the SHUFFLE write layout.
 
-    The fast path triggers per-block when (slot_first % 8 == 0) AND
-    (group has 8 real tokens). Otherwise the kernel takes a fallback path
-    that is bit-identical to AITER's existing per-warp scalar shuffle.
+    The fast path triggers per-block when 8 consecutive global tokens share
+    a contiguous chunk in the shuffle V cache (verified directly from
+    slot_mapping: slot_first is 8-aligned AND slot_last == slot_first + 7).
+    Otherwise the kernel takes a fallback path that is bit-identical to
+    AITER's existing per-warp scalar shuffle.
 
-    ``block_to_seq`` and ``block_to_group_in_seq`` are int32 workspace tensors
-    of length ``total_kv_blocks = sum_seqs(ceil(seq_query_len / 8))``, built on
-    host in O(num_seqs) from ``query_start_loc``.
+    No per-sequence workspace tensors are required — the KV grid is flat
+    over global tokens and the kernel uses slot_mapping directly to derive
+    group-to-cache addressing.
     """
     torch.ops._rocm_C.fused_qk_norm_rope_cache(
         qkv,
@@ -258,9 +257,6 @@ def fused_qk_norm_rope_cache(
         k_cache,
         v_cache,
         slot_mapping,
-        query_start_loc,
-        block_to_seq,
-        block_to_group_in_seq,
         per_tensor_k_scale,
         per_tensor_v_scale,
         kv_cache_dtype,

@@ -290,11 +290,8 @@ __launch_bounds__(256, 4) __global__ void fused_qk_norm_rope_cache_kernel(
     const T* __restrict__ qkv, const T* __restrict__ q_weight,
     const T* __restrict__ k_weight, const T* __restrict__ cos_sin_cache,
     const int64_t* __restrict__ positions, int64_t positions_stride,
-    const int64_t* __restrict__ slot_mapping,
-    const int32_t* __restrict__ block_to_seq,
-    const int32_t* __restrict__ block_to_group_in_seq,
-    const int32_t* __restrict__ query_start_loc, int num_heads_q,
-    int num_heads_k, int num_heads_v, float eps, float per_tensor_k_scale,
+    const int64_t* __restrict__ slot_mapping, int num_heads_q, int num_heads_k,
+    int num_heads_v, float eps, float per_tensor_k_scale,
     float per_tensor_v_scale, bool use_shuffle_layout, int block_size,
     int x_kv, T* __restrict__ q_out, CACHE_T* __restrict__ k_cache,
     CACHE_T* __restrict__ v_cache, T* __restrict__ k_out,
@@ -346,8 +343,14 @@ __launch_bounds__(256, 4) __global__ void fused_qk_norm_rope_cache_kernel(
 
   // -----------------------------------------------------------------------
   // KV phase: 8 warps per (8-token group, 1 kv_head). LDS staging fast path
-  // when (slot_first % 8 == 0) AND (num_real == 8); otherwise per-warp
-  // scalar-shuffle fallback (bit-identical to AITER).
+  // when 8 consecutive global tokens share a contiguous chunk in the
+  // shuffle V cache (verified directly from slot_mapping); otherwise
+  // per-warp scalar-shuffle fallback (bit-identical to AITER).
+  //
+  // The KV block grid is FLAT over global tokens:
+  //   kv_blocks = ceil(num_tokens / 8) * head_pair_count
+  // No per-sequence workspace tensors are required — slot_mapping itself
+  // tells us whether the group is fast-path-eligible.
   // -----------------------------------------------------------------------
   // x = 16 / sizeof(CACHE_T): bf16/fp16 -> 8, fp8 -> 16. Mailbox is 16 B.
   constexpr int X_KV = 16 / sizeof(CACHE_T);
@@ -369,20 +372,28 @@ __launch_bounds__(256, 4) __global__ void fused_qk_norm_rope_cache_kernel(
   const int head_pair_idx = kv_flat - group_id_global * head_pair_count;
   const int head_idx_base = head_pair_idx * HEADS_PER_BLOCK;
 
-  const int seq_idx = block_to_seq[group_id_global];
-  const int group_idx_in_seq = block_to_group_in_seq[group_id_global];
-
-  const int seq_token_offset = query_start_loc[seq_idx];
-  const int seq_query_len = query_start_loc[seq_idx + 1] - seq_token_offset;
-  const int group_first_token =
-      seq_token_offset + group_idx_in_seq * TOKENS_PER_GROUP;
+  // Group covers global token indices [group_first_token, group_first_token+8).
+  // num_real_in_group is clamped by num_tokens (last group may be partial).
+  const int group_first_token = group_id_global * TOKENS_PER_GROUP;
   const int num_real_in_group =
-      min(TOKENS_PER_GROUP, seq_query_len - group_idx_in_seq * TOKENS_PER_GROUP);
+      min(TOKENS_PER_GROUP, num_tokens - group_first_token);
+  if (num_real_in_group <= 0) return;
 
+  // Fast-path eligibility: probe slot_mapping for (1) full 8-token group,
+  // (2) the first slot is aligned to a chunk boundary, and (3) all 8 slots
+  // are contiguous in the cache (i.e. the group is wholly within a single
+  // sequence's block — discontinuity across sequence boundaries causes a
+  // jump in the flat slot index, automatically failing this test).
   const int64_t slot_first_val = slot_mapping[group_first_token];
-  const bool aligned = (slot_first_val >= 0) &&
-                       (slot_first_val % TOKENS_PER_GROUP == 0);
   const bool full = (num_real_in_group == TOKENS_PER_GROUP);
+  bool aligned = false;
+  if (full) {
+    const int64_t slot_last_val =
+        slot_mapping[group_first_token + TOKENS_PER_GROUP - 1];
+    aligned = (slot_first_val >= 0) &&
+              (slot_first_val % TOKENS_PER_GROUP == 0) &&
+              (slot_last_val == slot_first_val + TOKENS_PER_GROUP - 1);
+  }
   const bool use_fast = use_shuffle_layout && aligned && full;
 
   const bool warp_is_real = (warp < num_real_in_group);
@@ -551,15 +562,14 @@ template <typename T, typename CACHE_T, vllm::Fp8KVCacheDataType KV_DTYPE>
 void launch_typed(
     const T* qkv, const T* q_weight, const T* k_weight, const T* cos_sin_cache,
     const int64_t* positions, int64_t positions_stride,
-    const int64_t* slot_mapping, const int32_t* block_to_seq,
-    const int32_t* block_to_group_in_seq, const int32_t* query_start_loc,
-    int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v,
-    int head_dim, bool is_neox, float eps, float per_tensor_k_scale,
-    float per_tensor_v_scale, bool use_shuffle_layout, int block_size, int x,
-    int total_kv_blocks, T* q_out, CACHE_T* k_cache, CACHE_T* v_cache,
+    const int64_t* slot_mapping, int num_tokens, int num_heads_q,
+    int num_heads_k, int num_heads_v, int head_dim, bool is_neox, float eps,
+    float per_tensor_k_scale, float per_tensor_v_scale, bool use_shuffle_layout,
+    int block_size, int x, T* q_out, CACHE_T* k_cache, CACHE_T* v_cache,
     T* k_out, T* v_out, hipStream_t stream) {
   constexpr int kBlock = 256;
   constexpr int kWarpsPerBlock = kBlock / 32;
+  constexpr int TOKENS_PER_GROUP = 8;
 
   // HEADS_PER_BLOCK: 2 when num_heads_k is even and >= 2 (halves KV grid),
   // else 1. Selected at host via runtime check, kernel template-specialized.
@@ -573,7 +583,11 @@ void launch_typed(
   const int total_q_warps = num_tokens * num_heads_q;
   const int q_blocks =
       (total_q_warps + kWarpsPerBlock - 1) / kWarpsPerBlock;
-  const int kv_blocks = total_kv_blocks * head_pair_count;
+  // Flat KV grid over global tokens — shape-stable from num_tokens scalar.
+  // No per-sequence workspace tensors required.
+  const int total_kv_groups =
+      (num_tokens + TOKENS_PER_GROUP - 1) / TOKENS_PER_GROUP;
+  const int kv_blocks = total_kv_groups * head_pair_count;
   const int total_blocks = q_blocks + kv_blocks;
   if (total_blocks <= 0) return;
 
@@ -585,20 +599,18 @@ void launch_typed(
       fused_qk_norm_rope_cache_kernel<T, CACHE_T, HS, true, KV_DTYPE, HPB>    \
           <<<grid, kBlock, 0, stream>>>(                                      \
               qkv, q_weight, k_weight, cos_sin_cache, positions,              \
-              positions_stride, slot_mapping, block_to_seq,                   \
-              block_to_group_in_seq, query_start_loc, num_heads_q,            \
-              num_heads_k, num_heads_v, eps, per_tensor_k_scale,              \
-              per_tensor_v_scale, use_shuffle_layout, block_size, x, q_out,   \
-              k_cache, v_cache, k_out, v_out, num_tokens, q_blocks);          \
+              positions_stride, slot_mapping, num_heads_q, num_heads_k,       \
+              num_heads_v, eps, per_tensor_k_scale, per_tensor_v_scale,       \
+              use_shuffle_layout, block_size, x, q_out, k_cache, v_cache,     \
+              k_out, v_out, num_tokens, q_blocks);                            \
     } else {                                                                  \
       fused_qk_norm_rope_cache_kernel<T, CACHE_T, HS, false, KV_DTYPE, HPB>   \
           <<<grid, kBlock, 0, stream>>>(                                      \
               qkv, q_weight, k_weight, cos_sin_cache, positions,              \
-              positions_stride, slot_mapping, block_to_seq,                   \
-              block_to_group_in_seq, query_start_loc, num_heads_q,            \
-              num_heads_k, num_heads_v, eps, per_tensor_k_scale,              \
-              per_tensor_v_scale, use_shuffle_layout, block_size, x, q_out,   \
-              k_cache, v_cache, k_out, v_out, num_tokens, q_blocks);          \
+              positions_stride, slot_mapping, num_heads_q, num_heads_k,       \
+              num_heads_v, eps, per_tensor_k_scale, per_tensor_v_scale,       \
+              use_shuffle_layout, block_size, x, q_out, k_cache, v_cache,     \
+              k_out, v_out, num_tokens, q_blocks);                            \
     }                                                                         \
   } while (0)
 
@@ -635,9 +647,8 @@ void fused_qk_norm_rope_cache(
     int64_t num_heads_k, int64_t num_heads_v, int64_t head_dim, bool is_neox,
     double eps, torch::Tensor& q_out, torch::Tensor& k_cache,
     torch::Tensor& v_cache, torch::Tensor& slot_mapping,
-    torch::Tensor& query_start_loc, torch::Tensor& block_to_seq,
-    torch::Tensor& block_to_group_in_seq, torch::Tensor& per_tensor_k_scale,
-    torch::Tensor& per_tensor_v_scale, const std::string& kv_cache_dtype,
+    torch::Tensor& per_tensor_k_scale, torch::Tensor& per_tensor_v_scale,
+    const std::string& kv_cache_dtype,
     const std::optional<torch::Tensor>& k_out,
     const std::optional<torch::Tensor>& v_out, bool return_kv,
     bool use_shuffle_layout, int64_t block_size, int64_t x) {
@@ -649,16 +660,6 @@ void fused_qk_norm_rope_cache(
               "positions must be int64");
   TORCH_CHECK(slot_mapping.scalar_type() == at::ScalarType::Long,
               "slot_mapping must be int64");
-  TORCH_CHECK(block_to_seq.scalar_type() == at::ScalarType::Int,
-              "block_to_seq must be int32");
-  TORCH_CHECK(block_to_group_in_seq.scalar_type() == at::ScalarType::Int,
-              "block_to_group_in_seq must be int32");
-  TORCH_CHECK(query_start_loc.scalar_type() == at::ScalarType::Int,
-              "query_start_loc must be int32");
-  TORCH_CHECK(block_to_seq.is_contiguous() &&
-                  block_to_group_in_seq.is_contiguous() &&
-                  query_start_loc.is_contiguous(),
-              "block mapping tensors must be contiguous");
   TORCH_CHECK(head_dim == 64 || head_dim == 128,
               "fused_qk_norm_rope_cache supports head_dim 64 or 128, got ",
               head_dim);
@@ -667,7 +668,6 @@ void fused_qk_norm_rope_cache(
               "scales must be scalar tensors");
 
   const int num_tokens = static_cast<int>(qkv.size(0));
-  const int total_kv_blocks = static_cast<int>(block_to_seq.size(0));
 
   const at::cuda::OptionalCUDAGuard guard(device_of(qkv));
   hipStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -683,13 +683,11 @@ void fused_qk_norm_rope_cache(
       reinterpret_cast<const KV_T*>(k_weight.data_ptr()),                     \
       reinterpret_cast<const KV_T*>(cos_sin_cache.data_ptr()),                \
       positions.data_ptr<int64_t>(), pos_stride,                              \
-      slot_mapping.data_ptr<int64_t>(), block_to_seq.data_ptr<int32_t>(),     \
-      block_to_group_in_seq.data_ptr<int32_t>(),                              \
-      query_start_loc.data_ptr<int32_t>(), num_tokens,                        \
+      slot_mapping.data_ptr<int64_t>(), num_tokens,                           \
       static_cast<int>(num_heads_q), static_cast<int>(num_heads_k),           \
       static_cast<int>(num_heads_v), static_cast<int>(head_dim), is_neox,     \
       static_cast<float>(eps), k_scale_f, v_scale_f, use_shuffle_layout,      \
-      static_cast<int>(block_size), static_cast<int>(x), total_kv_blocks,     \
+      static_cast<int>(block_size), static_cast<int>(x),                      \
       reinterpret_cast<KV_T*>(q_out.data_ptr()),                              \
       reinterpret_cast<CACHE_T_TYPE*>(k_cache.data_ptr()),                    \
       reinterpret_cast<CACHE_T_TYPE*>(v_cache.data_ptr()),                    \
