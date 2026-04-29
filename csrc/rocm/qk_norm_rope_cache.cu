@@ -13,15 +13,20 @@
 // (validated in /app/bench-hbm: ~5x kernel-write speedup for full 8-token
 // groups, AITER-equivalent cost everywhere else).
 //
-// Two physical kernels share one host launcher:
-//   1) q_norm_rope_kernel: 1 warp per (token, q_head); RMSNorm + RoPE -> q_out.
-//   2) kv_norm_rope_cache_kernel: 8 warps per (8-token group, 1 kv_head).
-//      Per-warp compute (RMSNorm + RoPE for K, per-tensor quant for K and V).
-//      Fast path (dim-major LDS) when (slot_first % 8 == 0) AND (num_real == 8).
-//      Fallback path (per-warp scalar shuffle) otherwise — bit-identical to
-//      AITER's existing path.
-//      Per-seq grid via int32 block_to_seq + block_to_group_in_seq lookup,
-//      built host-side from query_start_loc.
+// SINGLE FUSED KERNEL with concatenated 1D grid: blockIdx.x < q_blocks_count
+// runs the Q phase (1 warp per (token, q_head), packed AITER-style); the
+// remaining blocks run the KV phase (8 warps per (8-token group, 1 kv_head),
+// cooperative LDS staging fast path).
+//
+// Q phase: warp-per-(token, q_head), 8 packed per block → fully utilized
+// even on tiny decode shapes.
+// KV phase: per-block-per-(group, kv_head) ownership enables the dim-major
+// LDS staging fast path on the SHUFFLE layout.
+//   Fast path (dim-major LDS) when (slot_first % 8 == 0) AND (num_real == 8).
+//   Fallback path (per-warp scalar shuffle) otherwise — bit-identical to
+//   AITER's existing path.
+//   Per-seq grid via int32 block_to_seq + block_to_group_in_seq lookup,
+//   built host-side from query_start_loc.
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -32,8 +37,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <optional>
 #include <string>
+#include <type_traits>
 
 #include "../attention/dtype_fp8.cuh"
 #include "../quantization/w8a8/fp8/amd/quant_utils.cuh"
@@ -156,11 +163,18 @@ __device__ __forceinline__ void warp_apply_rope_(
 
 // Element-wise per-tensor quant: T (input) -> CACHE_T (cache).
 // kAuto: identity copy (T == CACHE_T enforced by dispatch).
-// kFp8E4M3: vllm::fp8::scaled_convert.
+// kFp8E4M3: vllm::fp8::scaled_convert. For T == _Float16 we bit-cast to
+// uint16_t first because vllm::fp8::scaled_vec_conversion's half->fp8
+// specialization is keyed on the half-as-uint16 bit pattern (see
+// csrc/quantization/w8a8/fp8/amd/quant_utils.cuh:487-495).
 template <typename CACHE_T, typename T, vllm::Fp8KVCacheDataType KV_DTYPE>
 __device__ __forceinline__ CACHE_T quant_one_(const T& x, float scale) {
   if constexpr (KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto) {
     return x;
+  } else if constexpr (std::is_same_v<T, _Float16>) {
+    uint16_t bits;
+    __builtin_memcpy(&bits, &x, sizeof(uint16_t));
+    return vllm::fp8::scaled_convert<CACHE_T, uint16_t, KV_DTYPE>(bits, scale);
   } else {
     return vllm::fp8::scaled_convert<CACHE_T, T, KV_DTYPE>(x, scale);
   }
@@ -212,60 +226,18 @@ __device__ __forceinline__ int64_t shuffle_v_base_(int64_t slot_id,
 }
 
 // ===========================================================================
-// Q kernel: 1 warp per (token, q_head). RMSNorm + RoPE -> q_out.
-// ===========================================================================
-template <typename T, int HEAD_SIZE, bool IS_NEOX>
-__launch_bounds__(256, 2) __global__
-    void q_norm_rope_kernel(const T* __restrict__ qkv,
-                            const T* __restrict__ q_weight,
-                            const T* __restrict__ cos_sin_cache,
-                            const int64_t* __restrict__ positions,
-                            int64_t positions_stride, int num_heads_q,
-                            int num_heads_k, int num_heads_v, float eps,
-                            T* __restrict__ q_out, int num_tokens) {
-  constexpr int WARP_SIZE_ = 32;
-  constexpr int VEC_SIZE = HEAD_SIZE / WARP_SIZE_;
-  constexpr int HALF = HEAD_SIZE / 2;
-  const int wpb = blockDim.x / WARP_SIZE_;
-  const int warp = threadIdx.x / WARP_SIZE_;
-  const int lane = threadIdx.x % WARP_SIZE_;
-  const int gw = blockIdx.x * wpb + warp;
-  const int total_q = num_tokens * num_heads_q;
-  if (gw >= total_q) return;
-
-  const int token = gw / num_heads_q;
-  const int head = gw % num_heads_q;
-  const int access = lane * VEC_SIZE;
-  const int neighbor = (access < HALF ? HALF : -HALF) / VEC_SIZE;
-
-  const int total_heads = num_heads_q + num_heads_k + num_heads_v;
-  const T* qkv_ptr =
-      qkv + (static_cast<int64_t>(token) * total_heads + head) * HEAD_SIZE;
-
-  Vec<T, VEC_SIZE> w_vec, x_vec;
-  w_vec.load(q_weight + access);
-  x_vec.load(qkv_ptr + access);
-
-  warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, static_cast<float>(HEAD_SIZE), eps);
-
-  const int64_t pos = positions[token * positions_stride];
-  const T* cs_ptr = cos_sin_cache + pos * HEAD_SIZE;
-  warp_apply_rope_<T, VEC_SIZE, IS_NEOX, HEAD_SIZE>(x_vec, cs_ptr, access,
-                                                    neighbor, lane);
-
-  T* q_ptr =
-      q_out + (static_cast<int64_t>(token) * num_heads_q + head) * HEAD_SIZE;
-  x_vec.store(q_ptr + access);
-}
-
-// ===========================================================================
-// KV kernel: 8 warps per (8-token group, 1 kv_head).
+// Single fused kernel: Q phase + KV phase, concatenated 1D grid.
+//   blockIdx.x in [0, q_blocks_count)               => Q phase
+//   blockIdx.x in [q_blocks_count, total_blocks)    => KV phase
+// Each phase keeps its naturally-optimal per-block work distribution:
+//   * Q phase  : 1 warp = 1 (token, q_head), 8 packed per block.
+//   * KV phase : 1 block = 1 (8-token group, 1 kv_head), 8 cooperating warps.
 // ===========================================================================
 template <typename T, typename CACHE_T, int HEAD_SIZE, bool IS_NEOX,
           vllm::Fp8KVCacheDataType KV_DTYPE>
-__launch_bounds__(256, 2) __global__ void kv_norm_rope_cache_kernel(
-    const T* __restrict__ qkv, const T* __restrict__ k_weight,
-    const T* __restrict__ cos_sin_cache,
+__launch_bounds__(256, 2) __global__ void fused_qk_norm_rope_cache_kernel(
+    const T* __restrict__ qkv, const T* __restrict__ q_weight,
+    const T* __restrict__ k_weight, const T* __restrict__ cos_sin_cache,
     const int64_t* __restrict__ positions, int64_t positions_stride,
     const int64_t* __restrict__ slot_mapping,
     const int32_t* __restrict__ block_to_seq,
@@ -273,14 +245,59 @@ __launch_bounds__(256, 2) __global__ void kv_norm_rope_cache_kernel(
     const int32_t* __restrict__ query_start_loc, int num_heads_q,
     int num_heads_k, int num_heads_v, float eps, float per_tensor_k_scale,
     float per_tensor_v_scale, bool use_shuffle_layout, int block_size,
-    int x_kv, CACHE_T* __restrict__ k_cache, CACHE_T* __restrict__ v_cache,
-    T* __restrict__ k_out, T* __restrict__ v_out) {
+    int x_kv, T* __restrict__ q_out, CACHE_T* __restrict__ k_cache,
+    CACHE_T* __restrict__ v_cache, T* __restrict__ k_out,
+    T* __restrict__ v_out, int num_tokens, int q_blocks_count) {
   constexpr int WARP_SIZE_ = 32;
   constexpr int TOKENS_PER_GROUP = 8;
   constexpr int VEC_SIZE = HEAD_SIZE / WARP_SIZE_;
   constexpr int HALF = HEAD_SIZE / 2;
   static_assert(HEAD_SIZE == 64 || HEAD_SIZE == 128,
-                "kv_norm_rope_cache_kernel: HEAD_SIZE must be 64 or 128");
+                "fused_qk_norm_rope_cache_kernel: HEAD_SIZE must be 64 or 128");
+
+  const int warp = threadIdx.x / WARP_SIZE_;
+  const int lane = threadIdx.x % WARP_SIZE_;
+  const int access = lane * VEC_SIZE;
+  const int neighbor = (access < HALF ? HALF : -HALF) / VEC_SIZE;
+  const int total_heads = num_heads_q + num_heads_k + num_heads_v;
+
+  // -----------------------------------------------------------------------
+  // Q phase: 1 warp = 1 (token, q_head), 8 packed per block.
+  // -----------------------------------------------------------------------
+  if (blockIdx.x < q_blocks_count) {
+    const int wpb = blockDim.x / WARP_SIZE_;
+    const int gw = blockIdx.x * wpb + warp;
+    const int total_q = num_tokens * num_heads_q;
+    if (gw >= total_q) return;
+
+    const int token = gw / num_heads_q;
+    const int head = gw % num_heads_q;
+    const T* qkv_ptr =
+        qkv + (static_cast<int64_t>(token) * total_heads + head) * HEAD_SIZE;
+
+    Vec<T, VEC_SIZE> w_vec, x_vec;
+    w_vec.load(q_weight + access);
+    x_vec.load(qkv_ptr + access);
+
+    warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, static_cast<float>(HEAD_SIZE),
+                                eps);
+
+    const int64_t pos = positions[token * positions_stride];
+    const T* cs_ptr = cos_sin_cache + pos * HEAD_SIZE;
+    warp_apply_rope_<T, VEC_SIZE, IS_NEOX, HEAD_SIZE>(x_vec, cs_ptr, access,
+                                                      neighbor, lane);
+
+    T* q_ptr = q_out + (static_cast<int64_t>(token) * num_heads_q + head) *
+                           HEAD_SIZE;
+    x_vec.store(q_ptr + access);
+    return;
+  }
+
+  // -----------------------------------------------------------------------
+  // KV phase: 8 warps per (8-token group, 1 kv_head). LDS staging fast path
+  // when (slot_first % 8 == 0) AND (num_real == 8); otherwise per-warp
+  // scalar-shuffle fallback (bit-identical to AITER).
+  // -----------------------------------------------------------------------
   // x = 16 / sizeof(CACHE_T): bf16/fp16 -> 8, fp8 -> 16. Mailbox is 16 B.
   constexpr int X_KV = 16 / sizeof(CACHE_T);
   constexpr int NUM_CHUNKS = HEAD_SIZE / X_KV;
@@ -291,14 +308,17 @@ __launch_bounds__(256, 2) __global__ void kv_norm_rope_cache_kernel(
   // Dim-major V LDS row width (+1 pad to break 2-way bank conflict).
   constexpr int LDS_V_ROW = TOKENS_PER_GROUP + 1;
 
-  const int warp = threadIdx.x / WARP_SIZE_;
-  const int lane = threadIdx.x % WARP_SIZE_;
-  const int access = lane * VEC_SIZE;
-  const int neighbor = (access < HALF ? HALF : -HALF) / VEC_SIZE;
+  // Decode flat KV block index to (group_id_global, kv_head). Layout:
+  // kv_flat = group_id_global * num_heads_k + head_idx, so head_idx varies
+  // fastest and consecutive blocks share the same group_id_global → all
+  // kv_heads of a group probe the same slot_mapping[group_first_token],
+  // friendly for the slot probe load.
+  const int kv_flat = blockIdx.x - q_blocks_count;
+  const int group_id_global = kv_flat / num_heads_k;
+  const int head_idx = kv_flat - group_id_global * num_heads_k;
 
-  const int seq_idx = block_to_seq[blockIdx.x];
-  const int group_idx_in_seq = block_to_group_in_seq[blockIdx.x];
-  const int head_idx = blockIdx.y;
+  const int seq_idx = block_to_seq[group_id_global];
+  const int group_idx_in_seq = block_to_group_in_seq[group_id_global];
 
   const int seq_token_offset = query_start_loc[seq_idx];
   const int seq_query_len = query_start_loc[seq_idx + 1] - seq_token_offset;
@@ -307,7 +327,6 @@ __launch_bounds__(256, 2) __global__ void kv_norm_rope_cache_kernel(
   const int num_real_in_group =
       min(TOKENS_PER_GROUP, seq_query_len - group_idx_in_seq * TOKENS_PER_GROUP);
 
-  const int total_heads = num_heads_q + num_heads_k + num_heads_v;
   const int k_head_in_qkv = num_heads_q + head_idx;
   const int v_head_in_qkv = num_heads_q + num_heads_k + head_idx;
 
@@ -466,66 +485,48 @@ void launch_typed(
   constexpr int kBlock = 256;
   constexpr int kWarpsPerBlock = kBlock / 32;
 
-  // Q kernel.
-  if (num_tokens > 0 && num_heads_q > 0) {
-    const int total_q_warps = num_tokens * num_heads_q;
-    const int q_grid = (total_q_warps + kWarpsPerBlock - 1) / kWarpsPerBlock;
-#define LAUNCH_Q(HS)                                                          \
+  const int total_q_warps = num_tokens * num_heads_q;
+  const int q_blocks =
+      (total_q_warps + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  const int kv_blocks =
+      (num_heads_k > 0) ? (total_kv_blocks * num_heads_k) : 0;
+  const int total_blocks = q_blocks + kv_blocks;
+  if (total_blocks <= 0) return;
+
+  dim3 grid(total_blocks, 1, 1);
+
+#define LAUNCH(HS)                                                            \
   do {                                                                        \
     if (is_neox) {                                                            \
-      q_norm_rope_kernel<T, HS, true><<<q_grid, kBlock, 0, stream>>>(         \
-          qkv, q_weight, cos_sin_cache, positions, positions_stride,          \
-          num_heads_q, num_heads_k, num_heads_v, eps, q_out, num_tokens);     \
+      fused_qk_norm_rope_cache_kernel<T, CACHE_T, HS, true, KV_DTYPE>         \
+          <<<grid, kBlock, 0, stream>>>(                                      \
+              qkv, q_weight, k_weight, cos_sin_cache, positions,              \
+              positions_stride, slot_mapping, block_to_seq,                   \
+              block_to_group_in_seq, query_start_loc, num_heads_q,            \
+              num_heads_k, num_heads_v, eps, per_tensor_k_scale,              \
+              per_tensor_v_scale, use_shuffle_layout, block_size, x, q_out,   \
+              k_cache, v_cache, k_out, v_out, num_tokens, q_blocks);          \
     } else {                                                                  \
-      q_norm_rope_kernel<T, HS, false><<<q_grid, kBlock, 0, stream>>>(        \
-          qkv, q_weight, cos_sin_cache, positions, positions_stride,          \
-          num_heads_q, num_heads_k, num_heads_v, eps, q_out, num_tokens);     \
+      fused_qk_norm_rope_cache_kernel<T, CACHE_T, HS, false, KV_DTYPE>        \
+          <<<grid, kBlock, 0, stream>>>(                                      \
+              qkv, q_weight, k_weight, cos_sin_cache, positions,              \
+              positions_stride, slot_mapping, block_to_seq,                   \
+              block_to_group_in_seq, query_start_loc, num_heads_q,            \
+              num_heads_k, num_heads_v, eps, per_tensor_k_scale,              \
+              per_tensor_v_scale, use_shuffle_layout, block_size, x, q_out,   \
+              k_cache, v_cache, k_out, v_out, num_tokens, q_blocks);          \
     }                                                                         \
   } while (0)
-    if (head_dim == 64) {
-      LAUNCH_Q(64);
-    } else if (head_dim == 128) {
-      LAUNCH_Q(128);
-    } else {
-      TORCH_CHECK(false, "fused_qk_norm_rope_cache: unsupported head_dim ",
-                  head_dim);
-    }
-#undef LAUNCH_Q
-  }
 
-  // KV kernel.
-  if (total_kv_blocks > 0 && num_heads_k > 0) {
-    dim3 kv_grid(total_kv_blocks, num_heads_k, 1);
-#define LAUNCH_KV(HS)                                                          \
-  do {                                                                         \
-    if (is_neox) {                                                             \
-      kv_norm_rope_cache_kernel<T, CACHE_T, HS, true, KV_DTYPE>                \
-          <<<kv_grid, kBlock, 0, stream>>>(                                    \
-              qkv, k_weight, cos_sin_cache, positions, positions_stride,       \
-              slot_mapping, block_to_seq, block_to_group_in_seq,               \
-              query_start_loc, num_heads_q, num_heads_k, num_heads_v, eps,     \
-              per_tensor_k_scale, per_tensor_v_scale, use_shuffle_layout,      \
-              block_size, x, k_cache, v_cache, k_out, v_out);                  \
-    } else {                                                                   \
-      kv_norm_rope_cache_kernel<T, CACHE_T, HS, false, KV_DTYPE>               \
-          <<<kv_grid, kBlock, 0, stream>>>(                                    \
-              qkv, k_weight, cos_sin_cache, positions, positions_stride,       \
-              slot_mapping, block_to_seq, block_to_group_in_seq,               \
-              query_start_loc, num_heads_q, num_heads_k, num_heads_v, eps,     \
-              per_tensor_k_scale, per_tensor_v_scale, use_shuffle_layout,      \
-              block_size, x, k_cache, v_cache, k_out, v_out);                  \
-    }                                                                          \
-  } while (0)
-    if (head_dim == 64) {
-      LAUNCH_KV(64);
-    } else if (head_dim == 128) {
-      LAUNCH_KV(128);
-    } else {
-      TORCH_CHECK(false, "fused_qk_norm_rope_cache: unsupported head_dim ",
-                  head_dim);
-    }
-#undef LAUNCH_KV
+  if (head_dim == 64) {
+    LAUNCH(64);
+  } else if (head_dim == 128) {
+    LAUNCH(128);
+  } else {
+    TORCH_CHECK(false, "fused_qk_norm_rope_cache: unsupported head_dim ",
+                head_dim);
   }
+#undef LAUNCH
 }
 
 }  // namespace qk_norm_rope_cache
@@ -614,7 +615,7 @@ void fused_qk_norm_rope_cache(
       DISPATCH_BODY(__nv_bfloat16, __nv_bfloat16,
                     vllm::Fp8KVCacheDataType::kAuto);
     } else if (qkv.scalar_type() == at::ScalarType::Half) {
-      DISPATCH_BODY(uint16_t, uint16_t, vllm::Fp8KVCacheDataType::kAuto);
+      DISPATCH_BODY(_Float16, _Float16, vllm::Fp8KVCacheDataType::kAuto);
     } else {
       TORCH_CHECK(false, "Unsupported qkv dtype: ", qkv.scalar_type());
     }
@@ -622,7 +623,7 @@ void fused_qk_norm_rope_cache(
     if (qkv.scalar_type() == at::ScalarType::BFloat16) {
       DISPATCH_BODY(__nv_bfloat16, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
     } else if (qkv.scalar_type() == at::ScalarType::Half) {
-      DISPATCH_BODY(uint16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
+      DISPATCH_BODY(_Float16, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
     } else {
       TORCH_CHECK(false, "Unsupported qkv dtype: ", qkv.scalar_type());
     }
