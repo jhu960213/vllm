@@ -333,6 +333,134 @@ def test_bit_exact_vs_aiter(
 
 
 # ---------------------------------------------------------------------------
+# Bit-exact summary table (human-readable equivalent of the parametrized
+# test above; one PASS/FAIL per (config, workload) row covering both
+# RoPE styles).
+# ---------------------------------------------------------------------------
+def _max_abs_diff_bytes(a: torch.Tensor, b: torch.Tensor) -> int:
+    """Count mismatched bytes between two tensors (cheap, host-side after
+    a single equal() check)."""
+    if torch.equal(a, b):
+        return 0
+    return int((a != b).sum().item())
+
+
+def test_bit_exact_table_vs_aiter():
+    """One-shot bit-exact verification across all (config, workload) combos,
+    formatted as a readable summary table similar to the perf table.
+
+    For each row we run BOTH RoPE styles (neox + gptj) on identical inputs
+    and report PASS only if all 6 outputs (q_out / k_cache / v_cache for
+    each RoPE style) are byte-identical to AITER's.
+
+    Run with:
+        pytest tests/kernels/rocm/test_fused_qk_norm_rope_cache.py::test_bit_exact_table_vs_aiter -s
+    """
+    pytest.importorskip("aiter")
+
+    num_heads_q = 32
+    num_heads_k = 4
+    head_dim = 128
+    block_size = 16
+    eps = 1e-5
+
+    bf16, fp16 = torch.bfloat16, torch.float16
+
+    def cfg(layout, qkv, kv):
+        return f"{layout} in={qkv} kv={kv}"
+
+    # 8 (layout, qkv_dtype, kv_cache_dtype) configurations.
+    configs = [
+        (cfg("shuffle", "bf16", "bf16"), True,  "auto", bf16),
+        (cfg("shuffle", "fp16", "fp16"), True,  "auto", fp16),
+        (cfg("shuffle", "bf16", "fp8"),  True,  "fp8",  bf16),
+        (cfg("shuffle", "fp16", "fp8"),  True,  "fp8",  fp16),
+        (cfg("flash",   "bf16", "bf16"), False, "auto", bf16),
+        (cfg("flash",   "fp16", "fp16"), False, "auto", fp16),
+        (cfg("flash",   "bf16", "fp8"),  False, "fp8",  bf16),
+        (cfg("flash",   "fp16", "fp8"),  False, "fp8",  fp16),
+    ]
+
+    workloads = [
+        ("single_seq_aligned", [4096]),
+        ("multi_seq_full",     [128, 256, 512]),
+        ("multi_seq_tail",     [125, 251, 511]),
+        ("decode_only",        [1, 1, 1, 1]),
+    ]
+
+    rope_styles = [("neox", True), ("gptj", False)]
+
+    width = 130
+    print("\n")
+    print("=" * width)
+    print("Bit-exact verification: vLLM op output vs AITER op output "
+          "(matched layout + dtype, identical inputs).")
+    print("Each row tests both RoPE styles (neox + gptj). 'mismatch bytes' "
+          "counts diff bytes across q_out + k_cache + v_cache (sum of both styles).")
+    print("=" * width)
+    print(
+        f"  {'config':<25s}  {'workload':<22s}  "
+        f"{'q_out':>8s}  {'k_cache':>8s}  {'v_cache':>8s}  "
+        f"{'mismatch bytes':>14s}  result"
+    )
+    print("-" * width)
+
+    n_pass = 0
+    n_total = 0
+    for cfg_label, use_shuffle, kv_cache_dtype, dtype in configs:
+        for case_name, seq_lens in workloads:
+            inp = _make_inputs(
+                seq_lens=seq_lens, num_heads_q=num_heads_q,
+                num_heads_k=num_heads_k, head_dim=head_dim, dtype=dtype,
+                block_size=block_size, use_shuffle=use_shuffle,
+                kv_cache_dtype=kv_cache_dtype,
+            )
+            q_match = k_match = v_match = True
+            mismatch_bytes = 0
+            for _, is_neox in rope_styles:
+                q_a, k_a, v_a = _call_aiter(
+                    inp, num_heads_q, num_heads_k, head_dim, is_neox, eps,
+                    use_shuffle, block_size,
+                )
+                q_b, k_b, v_b = _call_vllm(
+                    inp, num_heads_q, num_heads_k, head_dim, is_neox, eps,
+                    use_shuffle, block_size,
+                )
+                torch.cuda.synchronize()
+                q_diff = _max_abs_diff_bytes(q_a, q_b)
+                k_diff = _max_abs_diff_bytes(k_a, k_b)
+                v_diff = _max_abs_diff_bytes(v_a, v_b)
+                if q_diff: q_match = False
+                if k_diff: k_match = False
+                if v_diff: v_match = False
+                mismatch_bytes += q_diff + k_diff + v_diff
+            n_total += 1
+            row_pass = q_match and k_match and v_match
+            if row_pass:
+                n_pass += 1
+            print(
+                f"  {cfg_label:<25s}  {case_name:<22s}  "
+                f"{'match' if q_match else 'DIFF':>8s}  "
+                f"{'match' if k_match else 'DIFF':>8s}  "
+                f"{'match' if v_match else 'DIFF':>8s}  "
+                f"{mismatch_bytes:>14d}  "
+                f"{'PASS' if row_pass else 'FAIL'}"
+            )
+
+    print("-" * width)
+    print(
+        f"  Total: {n_pass}/{n_total} rows passed "
+        f"({len(configs)} configs x {len(workloads)} workloads x "
+        f"{len(rope_styles)} RoPE styles = "
+        f"{len(configs) * len(workloads) * len(rope_styles)} sub-cases)"
+    )
+    print("=" * width)
+    assert n_pass == n_total, (
+        f"{n_total - n_pass}/{n_total} bit-exact rows failed; see table above"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Performance microbench
 # ---------------------------------------------------------------------------
 #
@@ -445,44 +573,84 @@ def _make_vllm_runner(
     return run
 
 
+def _expected_vllm_path(seq_lens, use_shuffle, block_size):
+    """Predict which path the vLLM op will take per group based on inputs.
+
+    Returns one of: "fast" (every group fast-paths), "mixed" (some groups
+    fast, some fallback), "fallback" (every group fallback).
+    """
+    if not use_shuffle:
+        # FLASH layout has no fast/fallback distinction — always per-warp
+        # vector store.
+        return "flash"
+
+    # Shuffle: fast path requires (slot_first % 8 == 0) AND (num_real == 8).
+    # In our test setup each seq starts on a fresh block boundary, so
+    # slot_first is always mod-block_size aligned (mod-8). The remaining
+    # gate is whether the group is full.
+    full_groups = sum(L // 8 for L in seq_lens)
+    tail_groups = sum(1 for L in seq_lens if L % 8 != 0)
+    short_groups = sum(1 for L in seq_lens if L < 8)
+    total_groups = full_groups + max(tail_groups, short_groups)
+    if total_groups == 0:
+        return "n/a"
+    if full_groups == total_groups:
+        return "fast"
+    if full_groups == 0:
+        return "fallback"
+    return "mixed"
+
+
 def _time_scenario(
-    label, seq_lens, num_heads_q, num_heads_k, head_dim, dtype,
-    kv_cache_dtype, block_size, is_neox, use_shuffle, eps, iters,
+    workload_label, seq_lens, num_heads_q, num_heads_k, head_dim, dtype,
+    vllm_kv_cache_dtype, aiter_kv_cache_dtype, block_size, is_neox,
+    vllm_use_shuffle, aiter_use_shuffle, eps, iters, comparison_label,
 ):
-    inp = _make_inputs(
+    """Time AITER vs the vLLM op on a workload. Each side may have its own
+    layout / kv_cache_dtype to support cross-layout comparisons (e.g. our
+    shuffle vs AITER's flash)."""
+    aiter_inp = _make_inputs(
         seq_lens=seq_lens, num_heads_q=num_heads_q,
         num_heads_k=num_heads_k, head_dim=head_dim, dtype=dtype,
-        block_size=block_size, use_shuffle=use_shuffle,
-        kv_cache_dtype=kv_cache_dtype,
+        block_size=block_size, use_shuffle=aiter_use_shuffle,
+        kv_cache_dtype=aiter_kv_cache_dtype,
+    )
+    vllm_inp = _make_inputs(
+        seq_lens=seq_lens, num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k, head_dim=head_dim, dtype=dtype,
+        block_size=block_size, use_shuffle=vllm_use_shuffle,
+        kv_cache_dtype=vllm_kv_cache_dtype,
     )
     aiter_run = _make_aiter_runner(
-        inp, num_heads_q, num_heads_k, head_dim, is_neox, eps, use_shuffle,
-        block_size,
+        aiter_inp, num_heads_q, num_heads_k, head_dim, is_neox, eps,
+        aiter_use_shuffle, block_size,
     )
     vllm_run = _make_vllm_runner(
-        inp, num_heads_q, num_heads_k, head_dim, is_neox, eps, use_shuffle,
-        block_size,
+        vllm_inp, num_heads_q, num_heads_k, head_dim, is_neox, eps,
+        vllm_use_shuffle, block_size,
     )
 
     aiter_us = _time_op(aiter_run, iters=iters)
     vllm_us = _time_op(vllm_run, iters=iters)
 
-    # Effective KV write traffic: 2 (K+V) * num_tokens * num_heads_kv *
-    # head_dim * cache_elem_bytes (real-token bytes only).
-    cache_elem_bytes = inp["k_cache"].element_size()
-    real_bytes = (
-        2 * sum(seq_lens) * num_heads_k * head_dim * cache_elem_bytes
-    )
+    # Effective KV-write bandwidth: real-token K+V bytes / time. We count
+    # against each side's own cache element size since the two ops may write
+    # caches of different element widths (bf16 vs fp8) in a cross-dtype row.
+    def gbs(us, inp):
+        elem_bytes = inp["k_cache"].element_size()
+        bytes_ = 2 * sum(seq_lens) * num_heads_k * head_dim * elem_bytes
+        return bytes_ / (us * 1e-6) / 1e9 if us > 0 else 0.0
 
-    def gbs(us):
-        return real_bytes / (us * 1e-6) / 1e9 if us > 0 else 0.0
+    speedup = aiter_us / vllm_us if vllm_us > 0 else 0.0
+    path = _expected_vllm_path(seq_lens, vllm_use_shuffle, block_size)
 
+    # comparison_label is a (vllm_cfg, aiter_cfg) tuple.
+    vllm_cfg, aiter_cfg = comparison_label
     print(
-        f"  {label:<40s} "
-        f"aiter={aiter_us:8.2f}us  vllm={vllm_us:8.2f}us  "
-        f"speedup={aiter_us / vllm_us:5.2f}x  "
-        f"effBW(aiter)={gbs(aiter_us):7.1f}GB/s  "
-        f"effBW(vllm)={gbs(vllm_us):7.1f}GB/s"
+        f"  {vllm_cfg:<25s}  {aiter_cfg:<25s}  {workload_label:<28s}  "
+        f"{aiter_us:8.2f}   {vllm_us:8.2f}    {speedup:5.2f}x    "
+        f"{gbs(aiter_us, aiter_inp):8.1f}    "
+        f"{gbs(vllm_us, vllm_inp):8.1f}    {path}"
     )
     return aiter_us, vllm_us
 
@@ -490,15 +658,25 @@ def _time_scenario(
 def test_perf_qwen3_30b():
     """Microbench at Qwen3-30B-A3B shape (ISL=1000, OSL=1000, conc=16).
 
+    Each row compares AITER vs the vLLM op on identical inputs and identical
+    layout/dtype settings — i.e. AITER's shuffle path vs vLLM's shuffle path,
+    AITER's flash path vs vLLM's flash path. The "vllm path" column shows
+    which internal path the vLLM op ended up taking:
+
+        fast      every 8-token group hits the dim-major LDS fast path
+        mixed     full groups go fast, tail groups fall back
+        fallback  every group falls back (decode, or len_i < 8)
+        flash     FLASH layout — single per-warp vector-store, no branching
+
     Hypothesis to confirm:
-      * SHUFFLE prefill: vLLM op (dim-major LDS fast path) is meaningfully
-        faster than AITER (scattered writes). bench-hbm predicts ~5x at
-        kernel-write-only level; here we see the full kernel speedup which
-        is bounded above by the write-time fraction of the kernel.
-      * SHUFFLE decode: vLLM op falls back to per-warp scattered writes
-        (bit-identical to AITER), so should be neutral (within noise).
-      * FLASH prefill/decode: both go through the same vector-store path
-        already; vLLM op should be neutral too.
+      * SHUFFLE prefill: vLLM (dim-major LDS) >> AITER (scattered writes).
+        bench-hbm predicts ~5x at kernel-write-only level; here we see the
+        full-kernel speedup, bounded above by write-time fraction of kernel.
+      * SHUFFLE decode: vLLM falls back; should match or beat AITER (single
+        kernel launch vs AITER's single launch, no LDS staging overhead).
+      * FLASH everywhere: both ops share the optimal vector-store path;
+        speedup comes purely from launch-overhead savings + slightly better
+        wave occupancy.
     """
     pytest.importorskip("aiter")
 
@@ -518,33 +696,113 @@ def test_perf_qwen3_30b():
     #   * Decode step: 16 tokens (1 per active seq), repeated 1000 times.
     scenarios = [
         # Pure prefill, single seq, ISL=1000 — fully fast-pathable.
-        ("prefill_1seq_1000tok",  [1000]),
+        ("prefill 1seq x 1000 tok",   [1000]),
         # Multi-seq prefill batch (e.g., 16 prefills concurrent in 1 step).
-        ("prefill_16seqs_x_1000", [1000] * 16),
+        ("prefill 16seqs x 1000 tok", [1000] * 16),
         # Decode step: 16 seqs x 1 token. Always fallback (bit-identical).
-        ("decode_16seqs_x_1tok",  [1] * 16),
+        ("decode  16seqs x 1 tok",    [1] * 16),
     ]
 
-    layout_combos = [
-        ("SHUFFLE",     True,  "auto", torch.bfloat16),
-        ("SHUFFLE-fp8", True,  "fp8",  torch.bfloat16),
-        ("FLASH",       False, "auto", torch.bfloat16),
+    # Comparison entry tuple:
+    #   (group_header, vllm_cfg_label, vllm_use_shuffle, vllm_kv_cache_dtype,
+    #                  aiter_cfg_label, aiter_use_shuffle, aiter_kv_cache_dtype,
+    #    qkv_dtype)
+    # Label convention: "<layout> in=<qkv_dtype> kv=<cache_dtype>"
+    # For example:
+    #   shuffle in=bf16 kv=bf16   shuffle layout, bf16 QKV input,  bf16 KV cache
+    #   shuffle in=bf16 kv=fp8    shuffle layout, bf16 QKV input,  fp8 KV cache
+    #                             (bf16 inputs are quantized to fp8 before caching)
+    #   flash in=fp16 kv=fp16     flash layout, fp16 input + fp16 cache
+    bf16, fp16 = torch.bfloat16, torch.float16
+
+    def cfg(layout: str, qkv: str, kv: str) -> str:
+        return f"{layout} in={qkv} kv={kv}"
+
+    comparisons = [
+        # ----- Same-layout: vLLM op vs AITER on the same layout -----
+        ("Same-layout (vLLM beats AITER on its own turf)",
+         cfg("shuffle", "bf16", "bf16"), True, "auto",
+         cfg("shuffle", "bf16", "bf16"), True, "auto", bf16),
+        (None,
+         cfg("shuffle", "fp16", "fp16"), True, "auto",
+         cfg("shuffle", "fp16", "fp16"), True, "auto", fp16),
+        (None,
+         cfg("shuffle", "bf16", "fp8"),  True, "fp8",
+         cfg("shuffle", "bf16", "fp8"),  True, "fp8",  bf16),
+        (None,
+         cfg("shuffle", "fp16", "fp8"),  True, "fp8",
+         cfg("shuffle", "fp16", "fp8"),  True, "fp8",  fp16),
+        (None,
+         cfg("flash",   "bf16", "bf16"), False, "auto",
+         cfg("flash",   "bf16", "bf16"), False, "auto", bf16),
+        (None,
+         cfg("flash",   "fp16", "fp16"), False, "auto",
+         cfg("flash",   "fp16", "fp16"), False, "auto", fp16),
+        (None,
+         cfg("flash",   "bf16", "fp8"),  False, "fp8",
+         cfg("flash",   "bf16", "fp8"),  False, "fp8",  bf16),
+        (None,
+         cfg("flash",   "fp16", "fp8"),  False, "fp8",
+         cfg("flash",   "fp16", "fp8"),  False, "fp8",  fp16),
+        # ----- Cross-layout: vLLM SHUFFLE vs AITER FLASH (matched dtypes) -----
+        # The killer question: does our SHUFFLE op match or beat AITER's
+        # optimal FLASH path? If yes, the shuffle penalty is fully closed
+        # at the kernel level — shuffle is no longer a bad layout choice
+        # for prefill performance.
+        ("Cross-layout (vLLM shuffle vs AITER's optimal flash, matched dtypes)",
+         cfg("shuffle", "bf16", "bf16"), True, "auto",
+         cfg("flash",   "bf16", "bf16"), False, "auto", bf16),
+        (None,
+         cfg("shuffle", "fp16", "fp16"), True, "auto",
+         cfg("flash",   "fp16", "fp16"), False, "auto", fp16),
+        (None,
+         cfg("shuffle", "bf16", "fp8"),  True, "fp8",
+         cfg("flash",   "bf16", "fp8"),  False, "fp8",  bf16),
+        (None,
+         cfg("shuffle", "fp16", "fp8"),  True, "fp8",
+         cfg("flash",   "fp16", "fp8"),  False, "fp8",  fp16),
     ]
 
+    width = 160
     print("\n")
-    print("=" * 110)
+    print("=" * width)
     print(
-        f"Qwen3-30B-A3B: num_heads_q={num_heads_q} num_heads_kv={num_heads_k}"
-        f" head_dim={head_dim} block_size={block_size}  iters={iters}"
+        f"Qwen3-30B-A3B microbench  -  num_heads_q={num_heads_q}  "
+        f"num_heads_kv={num_heads_k}  head_dim={head_dim}  "
+        f"block_size={block_size}  iters={iters}"
     )
-    print("=" * 110)
-    for layout_name, use_shuffle, kv_cache_dtype, dtype in layout_combos:
-        print(f"\n[{layout_name}]")
-        for label, seq_lens in scenarios:
+    print("Each row pairs an AITER kernel run vs a vLLM kernel run on "
+          "identical inputs. Times in microseconds.")
+    print("Config format: <layout> in=<qkv dtype> kv=<cache dtype>. "
+          "EffKV BW = real-token K+V bytes / time, GB/s (per side).")
+    print("=" * width)
+    print(
+        f"  {'vLLM config':<25s}  {'AITER config':<25s}  {'workload':<28s}  "
+        f"{'AITER':>8s}   {'vLLM':>8s}    speedup     "
+        f"{'AITER':>8s}    {'vLLM':>8s}    vllm path"
+    )
+    print(
+        f"  {'':<25s}  {'':<25s}  {'':<28s}  "
+        f"{'(us)':>8s}   {'(us)':>8s}              "
+        f"{'(GB/s)':>8s}    {'(GB/s)':>8s}"
+    )
+    print("-" * width)
+    for entry in comparisons:
+        (group_header, vllm_cfg, vllm_shuf, vllm_kvd,
+         aiter_cfg, aiter_shuf, aiter_kvd, dtype) = entry
+        if group_header is not None:
+            print()
+            print(f"  --- {group_header} ---")
+        for workload_label, seq_lens in scenarios:
             _time_scenario(
-                label=label, seq_lens=seq_lens, num_heads_q=num_heads_q,
-                num_heads_k=num_heads_k, head_dim=head_dim, dtype=dtype,
-                kv_cache_dtype=kv_cache_dtype, block_size=block_size,
-                is_neox=is_neox, use_shuffle=use_shuffle, eps=eps, iters=iters,
+                workload_label=workload_label, seq_lens=seq_lens,
+                num_heads_q=num_heads_q, num_heads_k=num_heads_k,
+                head_dim=head_dim, dtype=dtype,
+                vllm_kv_cache_dtype=vllm_kvd,
+                aiter_kv_cache_dtype=aiter_kvd,
+                block_size=block_size, is_neox=is_neox,
+                vllm_use_shuffle=vllm_shuf, aiter_use_shuffle=aiter_shuf,
+                eps=eps, iters=iters,
+                comparison_label=(vllm_cfg, aiter_cfg),
             )
-    print("=" * 110)
+    print("=" * width)
