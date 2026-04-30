@@ -95,53 +95,31 @@ using _B8x8 = uint2;
 using _B8x4 = int32_t;  // used in builtins
 using bit8_t = uint8_t;
 
-// CDNA4 (gfx950) hardware-accelerated LDS transposed loads.
-// Semantics (generic): each lane reads 64 bits from its own per-lane LDS
-// address; the hardware then transposes the tile across a group of lanes
-// (group size depends on element granularity: 4 lanes for b16, 8 lanes for
-// b8). After the transpose, each lane in a group ends up with N elements
-// (N = group size) from N consecutive per-lane source addresses at the
-// lane's own position index within the group.
+// NOTE(jhu96): CDNA4 (gfx950) hardware-accelerated LDS transposed loads
+// (ds_read_b64_tr_b16, ds_read_b64_tr_b8) are intentionally NOT integrated
+// into this kernel — both CDNA3 (gfx942) and CDNA4 (gfx950) use the
+// software LDS transpose path in Phase 2 (V-fetch).
 //
-// Typical use (V-fetch): have the group of lanes share a common head_dim
-// base and differ in token offset (0,1,...,N-1). After the transpose, each
-// lane holds N tokens at its unique head_dim (= head_dim_base + lane_in_group).
+// Reason: the hw-tr instructions deliver a per-lane layout that does not
+// match what our SV-MFMA operand A expects. Empirical diagnostic
+// (see /home/jackhu12/vllm-fusion-runs/diagnose_ds_read_tr*.hip):
 //
-// Only available on gfx950 (MI350X/MI355X). Replaces ~N scalar ds_read_u16
-// (or ds_read_u8) instructions per lane with a single transposed 64-bit LDS
-// load, delivering both wider bandwidth use and native bank-conflict-free
-// transpose.
-#if defined(__HIPCC__) && defined(__gfx950__)
-  #define VLLM_HAS_GFX950_DS_READ_TR 1
-using _B16x4_native_i16 =
-    __attribute__((__vector_size__(4 * sizeof(short)))) short;
-using _B8x8_native_i32 =
-    __attribute__((__vector_size__(2 * sizeof(int)))) int;
-
-// 4-way transpose for 16-bit elements (bf16 / f16).
-// Groups of 4 lanes each return 4 × 16-bit elements per lane.
+//   ds_read_tr16_b64 returns, per 16-lane block, a tile in
+//   "groups-of-4 lanes share head_dim, 4 lane-groups share token-chunk"
+//   form. Our SV-MFMA expects "16 unique head_dims across 16 lanes, all
+//   sharing the same 4 tokens" (row K = head_dim K, K-axis = tokens).
 //
-// The clang builtin signature is `V4s V4s*3` (non-const pointer in addrspace
-// 3). We accept a `const bit16_t*` for caller convenience and strip the
-// const here — the underlying ds_read_b64_tr_b16 hardware op is purely a
-// load and does not modify LDS, so the const cast is semantically safe.
-__device__ __forceinline__ _B16x4 ds_read_tr16_b64(const bit16_t* lds_ptr) {
-  _B16x4_native_i16 v = __builtin_amdgcn_ds_read_tr16_b64_v4i16(
-      reinterpret_cast<_B16x4_native_i16*>(const_cast<bit16_t*>(lds_ptr)));
-  return *reinterpret_cast<_B16x4*>(&v);
-}
-
-// 8-way transpose for 8-bit elements (fp8 / e4m3 / e5m2).
-// Groups of 8 lanes each return 8 × 8-bit elements per lane (returned as
-// _B8x8 = uint2 = 8 bytes). Same const-strip rationale as ds_read_tr16_b64.
-__device__ __forceinline__ _B8x8 ds_read_tr8_b64(const bit8_t* lds_ptr) {
-  _B8x8_native_i32 v = __builtin_amdgcn_ds_read_tr8_b64_v2i32(
-      reinterpret_cast<_B8x8_native_i32*>(const_cast<bit8_t*>(lds_ptr)));
-  return *reinterpret_cast<_B8x8*>(&v);
-}
-#else
-  #define VLLM_HAS_GFX950_DS_READ_TR 0
-#endif
+// Bridging the two requires either (a) cross-lane DPP/permute after the
+// hw-tr (kills the perf win), or (b) cascading layout changes through
+// v_lds, Vlocal, the SV-MFMA call site, and softmax (multi-kernel
+// refactor). Until (b) is implemented the software LDS transpose is the
+// correct & verified path. Cost: ~7 extra scalar 16-bit ds_read
+// instructions per Vlocal slot per lane, executed in LDS-bandwidth-bound
+// time — sub-percent end-to-end vs hw-tr.
+//
+// Empirical correctness: software path produces FLASH-vs-PAGED attention
+// output cosim = 1.0000 on identical K/V, while the hw-tr path gave 0.25
+// (catastrophic — gsm8k collapses to random baseline ~0.01).
 
 typedef struct _B8x16 {
   _B8x8 xy[2];
@@ -670,6 +648,20 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
     const cache_t* v_ptr_head = v_cache + wg_start_kv_head_idx * HEAD_SIZE;
 
+    // Optimization 4: Hoist per-thread step-2 column-base LDS pointers out
+    // of the batch loop. v_lds_col_base[vhe] points to v_lds row 0 at this
+    // thread's unique head_dim — depends only on warpid/lane16id/vhe_depth
+    // (all loop-invariant), so it's computed once per kernel invocation and
+    // its address-arithmetic ALU latency is overlapped with the
+    // step-1-write → step-2-read __syncthreads() barrier wait below.
+    cache_t* v_lds_col_base[VHELOOP];
+    #pragma unroll
+    for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+      const int vhead_elem =
+          vhe_depth * NWARPS * 16 + warpid * 16 + lane16id;
+      v_lds_col_base[vhe_depth] = &v_lds[0][vhead_elem];
+    }
+
     for (int batch = 0; batch < V_BATCHES; batch++) {
       const int batch_block_start = batch * V_LDS_BLOCKS_PER_BATCH;
       const int batch_block_count =
@@ -711,118 +703,71 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
       __syncthreads();
 
-      // Step 2: Transposed LDS read — each row reads its block's data
-      // in token-ordered fashion to produce the Vlocal register layout
-      // expected by the SV MFMA.
+      // Step 2: Software LDS transpose — each row reads its block's data
+      // from LDS in token-ordered fashion to produce the Vlocal register
+      // layout expected by the SV MFMA.
       //
-      // All paths below operate on the LDS contents written by Step 1's
-      // cooperative coalesced load — none of them perform scalar global
-      // gathers. They only differ in how the token-dim → head-dim
-      // transpose is expressed on the LDS side:
+      // All reads below are from LDS (populated by Step 1's cooperative
+      // coalesced HBM-to-LDS load) — no global gathers. Each lane issues
+      // CONTIGUOUS_KV_ELEMS_16B_LOAD strided LDS halfword/byte reads that
+      // collectively form the token-dim → head-dim transpose.
       //
-      // - gfx950 (CDNA4), 16-bit KV (bf16/f16): ds_read_b64_tr_b16
-      //     Groups of 4 lanes, 4 tokens per lane per call.
-      //     2 calls per _B16x8 Vlocal slot.
-      // - gfx950 (CDNA4), 8-bit KV (fp8):       ds_read_b64_tr_b8
-      //     Groups of 8 lanes, 8 tokens per lane per call.
-      //     2 calls per _B16x8 slot (_B16x8 aliases _B8x16 for fp8).
-      // - gfx942 (CDNA3) or any non-gfx950 target: software LDS transpose
-      //     Per-lane strided LDS reads that collectively form a transpose,
-      //     producing the same Vlocal register layout as the hardware paths.
-      //
-      // The rowid-based gating is compatible with the hardware transpose
-      // instructions because entire 16-lane rows are gated uniformly, so all
-      // lanes within a 4-lane (tr16) or 8-lane (tr8) transpose group are
-      // either all active or all inactive, preserving per-group activity
-      // coherence.
+      // Both CDNA3 (gfx942) and CDNA4 (gfx950) use this path. The CDNA4
+      // hardware LDS transpose intrinsics (ds_read_b64_tr_b16,
+      // ds_read_b64_tr_b8) are not integrated — see the top-of-file note
+      // for the layout-mismatch reason and empirical correctness data.
       for (int b = 0; b < batch_block_count; b++) {
         const int flat_block_idx = batch_block_start + b;
         const int target_vtoken_depth = flat_block_idx / ROWS_PER_WARP;
         const int target_row = flat_block_idx % ROWS_PER_WARP;
 
         if (rowid == target_row) {
-#if VLLM_HAS_GFX950_DS_READ_TR
-          if constexpr (sizeof(cache_t) == 2) {
-            // 16-bit hardware transpose path (ds_read_b64_tr_b16).
-            // Within each 4-lane group (lane16id/4), all 4 lanes share the
-            // same head_dim_base but differ in token offset (0..3). The
-            // instruction's intra-group transpose then delivers 4 tokens at
-            // the lane's unique head_dim (= head_dim_base + lane_in_group).
-            const int lane_in_group = lane16id % 4;
-            const int group_head_dim_base = (lane16id / 4) * 4;
-            for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
-              const int head_dim_base = vhe_depth * NWARPS * 16 +
-                                        warpid * 16 + group_head_dim_base;
-              for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP;
-                   vfetch_depth++) {
-                const int token_base =
-                    vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
-                // Two transposed 64-bit loads per 8-token slot: first 4
-                // tokens → .xy[0], second 4 tokens → .xy[1].
-                Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth].xy[0] =
-                    ds_read_tr16_b64(reinterpret_cast<const bit16_t*>(
-                        &v_lds[b * BLOCK_SIZE + token_base + 0 +
-                               lane_in_group][head_dim_base]));
-                Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth].xy[1] =
-                    ds_read_tr16_b64(reinterpret_cast<const bit16_t*>(
-                        &v_lds[b * BLOCK_SIZE + token_base + 4 +
-                               lane_in_group][head_dim_base]));
+          // All reads below are from LDS (populated by Step 1's cooperative
+          // coalesced load) — not from global memory. Each lane issues
+          // CONTIGUOUS_KV_ELEMS_16B_LOAD strided LDS halfword/byte reads
+          // that collectively form the token-dim → head-dim transpose.
+          //
+          // Optimization 1: pair-friendly addressing for ds_read2_b16
+          // emission. The hoisted v_lds_col_base[vhe_depth] gives this
+          // lane its unique head_dim base in v_lds row 0. We then offset
+          // by the row stride (HEAD_SIZE elements per token row) for each
+          // pair of consecutive tokens.
+          //
+          // Inner pair loop pattern:
+          //   pair_base = col_ptr + p * HEAD_SIZE   // bumps every 2 rows
+          //   temp[p]   = pair_base[0]              // row p's halfword
+          //   temp[p+1] = pair_base[HEAD_SIZE]      // row p+1's halfword
+          //
+          // The two reads within a pair have offsets (0, HEAD_SIZE elems)
+          // = (0, 128 halfwords / 256 B) for HD=128 bf16. Both fit in the
+          // ds_read2_b16 8-bit halfword-scaled offset slots (≤ 255). With
+          // pair_base rebased every 2 rows the compiler's
+          // SILoadStoreOptimizer pass can lower each pair to a single
+          // ds_read2_b16 (one LDS instruction = two 16-bit reads).
+          // Result: 8 scalar ds_read_u16 → 4 ds_read2_b16 per Vlocal slot.
+          //
+          // For fp8 (cache_t = uint8_t) AMDGPU has no ds_read2_b8; the
+          // compiler keeps individual ds_read_u8 here. No benefit, no
+          // regression.
+          #pragma unroll
+          for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+            cache_t* col_base = v_lds_col_base[vhe_depth] +
+                                b * BLOCK_SIZE * HEAD_SIZE;
+            #pragma unroll
+            for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP;
+                 vfetch_depth++) {
+              cache_t* col_ptr =
+                  col_base +
+                  vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD * HEAD_SIZE;
+              cache_t temp[CONTIGUOUS_KV_ELEMS_16B_LOAD];
+              #pragma unroll
+              for (int p = 0; p < CONTIGUOUS_KV_ELEMS_16B_LOAD; p += 2) {
+                cache_t* pair_base = col_ptr + p * HEAD_SIZE;
+                temp[p]     = pair_base[0];
+                temp[p + 1] = pair_base[HEAD_SIZE];
               }
-            }
-          } else if constexpr (sizeof(cache_t) == 1) {
-            // 8-bit hardware transpose path (ds_read_b64_tr_b8).
-            // Within each 8-lane group (lane16id/8), all 8 lanes share the
-            // same head_dim_base but differ in token offset (0..7). The
-            // instruction's intra-group transpose delivers 8 tokens at the
-            // lane's unique head_dim (= head_dim_base + lane_in_group).
-            const int lane_in_group = lane16id % 8;
-            const int group_head_dim_base = (lane16id / 8) * 8;
-            for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
-              const int head_dim_base = vhe_depth * NWARPS * 16 +
-                                        warpid * 16 + group_head_dim_base;
-              for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP;
-                   vfetch_depth++) {
-                const int token_base =
-                    vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
-                // VTLANELOOP == 1 for fp8 HD=128/64 (16 tokens per slot).
-                // Two transposed 64-bit loads: first 8 tokens fill the low
-                // 8 bytes of the slot, second 8 tokens fill the high 8 bytes.
-                _B8x8 result_lo = ds_read_tr8_b64(reinterpret_cast<const bit8_t*>(
-                    &v_lds[b * BLOCK_SIZE + token_base + 0 + lane_in_group]
-                          [head_dim_base]));
-                _B8x8 result_hi = ds_read_tr8_b64(reinterpret_cast<const bit8_t*>(
-                    &v_lds[b * BLOCK_SIZE + token_base + 8 + lane_in_group]
-                          [head_dim_base]));
-                // _B16x8 and _B8x16 share the same 16-byte storage.
-                // Each .xy[i] slot is 8 bytes — matches _B8x8 exactly.
-                Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth].xy[0] =
-                    *reinterpret_cast<const _B16x4*>(&result_lo);
-                Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth].xy[1] =
-                    *reinterpret_cast<const _B16x4*>(&result_hi);
-              }
-            }
-          } else
-#endif
-          {
-            // Software LDS transpose path (CDNA3 / any non-gfx950 target).
-            // All reads below are from LDS (populated by Step 1's cooperative
-            // coalesced load) — not from global memory. Each lane issues
-            // CONTIGUOUS_KV_ELEMS_16B_LOAD strided LDS halfword/byte reads
-            // that collectively form the token-dim → head-dim transpose.
-            for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
-              const int vhead_elem =
-                  vhe_depth * NWARPS * 16 + warpid * 16 + lane16id;
-              for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP;
-                   vfetch_depth++) {
-                cache_t temp[CONTIGUOUS_KV_ELEMS_16B_LOAD];
-                for (int t = 0; t < CONTIGUOUS_KV_ELEMS_16B_LOAD; t++) {
-                  const int bo =
-                      vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD + t;
-                  temp[t] = v_lds[b * BLOCK_SIZE + bo][vhead_elem];
-                }
-                Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth] =
-                    *reinterpret_cast<const _B16x8*>(temp);
-              }
+              Vlocal[target_vtoken_depth][vhe_depth][vfetch_depth] =
+                  *reinterpret_cast<const _B16x8*>(temp);
             }
           }
         }
