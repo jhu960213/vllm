@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
@@ -15,6 +16,18 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
     ROCMAiterMLASparseBackend,
 )
+
+# FlyDSL is an optional aiter extra; a missing or mismatched install must not stop
+# model init when VLLM_ROCM_USE_FLYDSL_MLA_PREP is off. getattr, not just except
+# ImportError: an older flydsl imports fine but lacks the entry point.
+try:
+    from aiter.ops.flydsl.kernels import (
+        mla_indexer_qk_norm_rope_quant_cache as _flydsl_mod,
+    )
+
+    flydsl_mla_indexer_prep = getattr(_flydsl_mod, "flydsl_mla_indexer_prep", None)
+except (ImportError, AttributeError):
+    flydsl_mla_indexer_prep = None
 
 
 class DeepseekV32ROCmIndexerCache(DeepseekV32IndexerCache):
@@ -88,6 +101,14 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
             and q_index_buffer is not None
             and index_weights_buffer is not None
             and self._fp8_kv_needs_view
+        )
+        # One FlyDSL launch for both cache ops; falls back per layer when the
+        # indexer is inactive, where the MLA half alone loses to aiter (0.95-0.99x
+        # at long prefill).
+        self._use_flydsl_mla_prep = (
+            self._use_aiter_qk_norm_rope
+            and flydsl_mla_indexer_prep is not None
+            and envs.VLLM_ROCM_USE_FLYDSL_MLA_PREP
         )
         self._q_c_norm_buffer = q_c_norm_buffer
         self._kv_c_norm_buffer = kv_c_norm_buffer
@@ -390,6 +411,7 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
         num_tokens = q_c.shape[0]
         ql_nope, q_pe = self._compute_w_uk_absorbed_ql_nope_and_q_pe(q_c)
         q_index = self._project_q_index(q_c)
+        mqa_q = self._mqa_q_buffer[: ql_nope.shape[0]]
 
         # Unread placeholders: _run_indexer is guarded on the indexer being active.
         q_index_fp8 = self._q_index_buffer[:0]
@@ -398,6 +420,26 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
             assert q_index is not None and index_weights is not None
             q_index_fp8 = self._q_index_buffer[:num_tokens]
             index_weights_out = self._index_weights_buffer[:num_tokens]
+
+        if has_caches and active_indexer is not None and self._use_flydsl_mla_prep:
+            self._flydsl_prep(
+                positions,
+                ql_nope,
+                q_pe,
+                kv_c,
+                k_pe,
+                mqa_q,
+                q_index,
+                q_index_fp8,
+                index_weights,
+                index_weights_out,
+                index_k,
+                mla_slot,
+                active_indexer,
+            )
+            return q_c, ql_nope, mqa_q, q_index_fp8, index_weights_out
+
+        if active_indexer is not None:
             if has_caches:
                 rocm_aiter_ops.get_indexer_qk_rope_quant_and_cache_op()(
                     q_index,
@@ -425,7 +467,6 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
                 q_index_fp8.zero_()
                 index_weights_out.zero_()
 
-        mqa_q = self._mqa_q_buffer[: ql_nope.shape[0]]
         if has_caches:
             rocm_aiter_ops.get_fused_qk_rope_concat_and_cache_mla_op()(
                 ql_nope,
@@ -445,6 +486,64 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
                 True,  # MLA packs [ql_nope; q_pe] nope-first
             )
         return q_c, ql_nope, mqa_q, q_index_fp8, index_weights_out
+
+    def _flydsl_prep(
+        self,
+        positions: torch.Tensor,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        mqa_q: torch.Tensor,
+        q_index: torch.Tensor,
+        q_index_fp8: torch.Tensor,
+        index_weights: torch.Tensor,
+        index_weights_out: torch.Tensor,
+        index_k: torch.Tensor,
+        mla_slot: torch.Tensor,
+        active_indexer: DeepseekV32Indexer,
+    ) -> None:
+        """Both cache ops in one FlyDSL launch, writing the same buffers as aiter."""
+        # Guaranteed by the _use_flydsl_mla_prep gate; asserted to narrow the
+        # optional import for mypy.
+        assert flydsl_mla_indexer_prep is not None
+        # The MLA half implements GPT-J RoPE only; attention.py builds this
+        # embedding is_neox_style=False, so a True here means the model changed.
+        assert not self.rotary_emb.is_neox_style, (
+            "FlyDSL MLA prep implements GPT-J RoPE only"
+        )
+        shared_rope = self._index_cos is self._rope_cos
+        flydsl_mla_indexer_prep(
+            mla_slot,
+            positions,
+            self._rope_cos,
+            self._rope_sin,
+            # GLM-5.2 memoises both rope caches to one object; None reuses the MLA
+            # buffer descriptor rather than building a second pair.
+            idx_cos_cache=None if shared_rope else self._index_cos,
+            idx_sin_cache=None if shared_rope else self._index_sin,
+            ql_nope=ql_nope,
+            q_pe=q_pe,
+            kv_c=kv_c,
+            k_pe=k_pe,
+            mqa_q=mqa_q,
+            # aiter rejects the raw uint8 cache; the enable gate guarantees fp8.
+            kv_cache=self.kv_cache.view(torch.float8_e4m3fn),
+            q_scale=self._q_scale,
+            k_scale=self._k_scale,
+            q_index=q_index,
+            q_out=q_index_fp8,
+            weights=index_weights,
+            weights_out=index_weights_out,
+            index_k=index_k,
+            k_cache=active_indexer.k_cache.kv_cache,
+            norm_weight=active_indexer.k_norm.weight,
+            norm_bias=active_indexer.k_norm.bias,
+            eps=active_indexer.k_norm.eps,
+            weights_scale=active_indexer.softmax_scale * active_indexer.n_head**-0.5,
+            preshuffle=active_indexer.k_cache.uses_shuffled_layout,
+            idx_neox=self.indexer_rope_emb.is_neox_style,
+        )
 
     def _prepare_attn_inputs(
         self,

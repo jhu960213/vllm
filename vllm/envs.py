@@ -147,6 +147,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_MLA_QK_NORM_ROPE: bool = False
+    VLLM_ROCM_USE_FLYDSL_MLA_PREP: bool = False
     VLLM_ROCM_USE_AITER_FUSED_AR_RMSNORM: bool = False
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
@@ -1349,6 +1350,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_MLA_QK_NORM_ROPE": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MLA_QK_NORM_ROPE", "False").lower()
         in ("true", "1")
+    ),
+    # Replace the two aiter cache ops in the deepseek_v32 path with one FlyDSL
+    # kernel. Requires VLLM_ROCM_USE_AITER_MLA_QK_NORM_ROPE and indexer layers.
+    "VLLM_ROCM_USE_FLYDSL_MLA_PREP": lambda: (
+        os.getenv("VLLM_ROCM_USE_FLYDSL_MLA_PREP", "False").lower() in ("true", "1")
     ),
     # Fuse the all-reduce with the following RMSNorm via aiter's custom
     # all-reduce in the ROCm deepseek_v32 path, instead of a separate
