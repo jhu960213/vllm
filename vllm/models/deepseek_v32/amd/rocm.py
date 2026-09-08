@@ -6,6 +6,7 @@ import torch
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
@@ -19,12 +20,6 @@ from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
 )
 
 logger = init_logger(__name__)
-
-# Token count at or below which the prep region takes the FlyDSL fused kernel.
-# Not the same as "runs inside the cudagraph": uniform-decode batches up to
-# max_cudagraph_capture_size (512 here) replay a FULL captured graph and anything
-# else is eager, so a small chunked-prefill batch is under this bound yet eager.
-FLYDSL_MAX_TOKENS = 256
 
 # FlyDSL is an optional aiter extra; a missing or mismatched install must not stop
 # model init when VLLM_ROCM_USE_FLYDSL_MLA_PREP is off. getattr, not just except
@@ -430,15 +425,22 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
             q_index_fp8 = self._q_index_buffer[:num_tokens]
             index_weights_out = self._index_weights_buffer[:num_tokens]
 
-        # Small batches take the FlyDSL kernel, larger ones the two aiter ops.
+        # Take the FlyDSL kernel exactly where the forward is captured, and leave
+        # every eager batch on the two aiter ops. deepseek_v32 has no
+        # @support_torch_compile, so there are no piecewise segments for it: a FULL
+        # runtime mode means this whole layer forward is inside a cudagraph, which
+        # also bounds num_tokens by max_cudagraph_capture_size. For a captured batch
+        # this predicate is evaluated once at capture time and baked into the graph,
+        # which is what makes it a compile-time-stable choice rather than a per-step
+        # branch.
         # All-or-nothing per batch: handing the kernel a partial row range shows a
         # nondeterministic ~1-token difference in the indexer K cache that aiter on
-        # both halves does not reproduce, so the split form is deliberately unused.
+        # both halves does not reproduce, so no row-wise split is attempted.
         if (
             has_caches
             and active_indexer is not None
             and self._use_flydsl_mla_prep
-            and num_tokens <= FLYDSL_MAX_TOKENS
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
         ):
             self._flydsl_prep(
                 positions,
