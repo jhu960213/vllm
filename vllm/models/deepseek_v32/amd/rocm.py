@@ -20,6 +20,12 @@ from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
 
 logger = init_logger(__name__)
 
+# Token count at or below which the prep region takes the FlyDSL fused kernel.
+# Not the same as "runs inside the cudagraph": uniform-decode batches up to
+# max_cudagraph_capture_size (512 here) replay a FULL captured graph and anything
+# else is eager, so a small chunked-prefill batch is under this bound yet eager.
+FLYDSL_MAX_TOKENS = 256
+
 # FlyDSL is an optional aiter extra; a missing or mismatched install must not stop
 # model init when VLLM_ROCM_USE_FLYDSL_MLA_PREP is off. getattr, not just except
 # ImportError: an older flydsl imports fine but lacks the entry point.
@@ -424,16 +430,15 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
             q_index_fp8 = self._q_index_buffer[:num_tokens]
             index_weights_out = self._index_weights_buffer[:num_tokens]
 
-        # Decode only. End-to-end the kernel is +0.5-0.9% on decode and balanced
-        # batches but mixed on prefill (0.90-1.01x), so prefill stays on the two
-        # aiter ops -- bench 20260908_151337_bigfusion. num_prefills is set from
-        # split_decodes_and_prefills; a backend without it falls back to aiter.
-        decode_only = getattr(attn_metadata, "num_prefills", None) == 0
+        # Small batches take the FlyDSL kernel, larger ones the two aiter ops.
+        # All-or-nothing per batch: handing the kernel a partial row range shows a
+        # nondeterministic ~1-token difference in the indexer K cache that aiter on
+        # both halves does not reproduce, so the split form is deliberately unused.
         if (
             has_caches
             and active_indexer is not None
             and self._use_flydsl_mla_prep
-            and decode_only
+            and num_tokens <= FLYDSL_MAX_TOKENS
         ):
             self._flydsl_prep(
                 positions,
