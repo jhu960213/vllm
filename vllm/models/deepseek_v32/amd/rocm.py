@@ -7,6 +7,7 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention, DeepseekV32Indexer
@@ -16,6 +17,8 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
     ROCMAiterMLASparseBackend,
 )
+
+logger = init_logger(__name__)
 
 # FlyDSL is an optional aiter extra; a missing or mismatched install must not stop
 # model init when VLLM_ROCM_USE_FLYDSL_MLA_PREP is off. getattr, not just except
@@ -421,7 +424,17 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
             q_index_fp8 = self._q_index_buffer[:num_tokens]
             index_weights_out = self._index_weights_buffer[:num_tokens]
 
-        if has_caches and active_indexer is not None and self._use_flydsl_mla_prep:
+        # Decode only. End-to-end the kernel is +0.5-0.9% on decode and balanced
+        # batches but mixed on prefill (0.90-1.01x), so prefill stays on the two
+        # aiter ops -- bench 20260908_151337_bigfusion. num_prefills is set from
+        # split_decodes_and_prefills; a backend without it falls back to aiter.
+        decode_only = getattr(attn_metadata, "num_prefills", None) == 0
+        if (
+            has_caches
+            and active_indexer is not None
+            and self._use_flydsl_mla_prep
+            and decode_only
+        ):
             self._flydsl_prep(
                 positions,
                 ql_nope,
@@ -504,6 +517,9 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
         active_indexer: DeepseekV32Indexer,
     ) -> None:
         """Both cache ops in one FlyDSL launch, writing the same buffers as aiter."""
+        logger.info_once(
+            "Using the FlyDSL fused MLA+indexer prep kernel (decode batches)."
+        )
         # Guaranteed by the _use_flydsl_mla_prep gate; asserted to narrow the
         # optional import for mypy.
         assert flydsl_mla_indexer_prep is not None
